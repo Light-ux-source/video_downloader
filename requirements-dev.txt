@@ -1,0 +1,4 @@
+# 后端为纯标准库实现，运行时不依赖任何第三方包（yt-dlp 由 setup.sh 安装）。
+# 下面仅用于开发期自测，可选安装：
+#   ./run.sh -m pip install -i https://mirrors.ustc.edu.cn/pypi/simple/ pytest
+pytest>=8.0
