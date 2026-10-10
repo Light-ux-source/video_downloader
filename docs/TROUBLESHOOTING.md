@@ -44,6 +44,41 @@
 **结论**：这是 yt-dlp 上游缺口，不是本项目配置问题，也不是 cookies 能解决的。
 程序会给出明确提示而不是含糊报错。要根治需要换用别的签名实现（工作量属另一个量级）。
 
+#### 深挖记录（2026-10 实测，供后续参考）
+
+为了确认"是否只是配置问题"，对抖音做了穷举式探测，结论是**接口层已全面要求签名**：
+
+| 尝试 | 结果 |
+|---|---|
+| `www.douyin.com/aweme/v1/web/aweme/detail/`（新版接口，带完整 web 参数 + 代理 + cookies） | **HTTP 403 Forbidden** |
+| 同上（不带额外参数） | HTTP 403 |
+| `www.iesdouyin.com/aweme/v1/web/aweme/detail/`（移动端语义 + iPhone UA） | HTTP 403 |
+| `www.douyin.com/web/api/v2/aweme/iteminfo/`（旧版接口） | HTTP 200 但返回<br>`{"status_code": 11110, "status_msg": "encrypt_data_miss"}` |
+| `www.iesdouyin.com/web/api/v2/aweme/iteminfo/`（旧版接口 + 移动端请求头） | HTTP 200，**响应体为空** |
+| `www.douyin.com/share/video/<id>/`（桌面分享页） | HTTP 200，返回**反爬 JS-VM**（`_$jsvmprt`），无任何 JSON 数据 |
+| `www.iesdouyin.com/share/video/<id>/`（移动端分享页） | 同上 |
+| `v.douyin.com` 短链 | yt-dlp 提取器正则中不存在 |
+
+`status_msg: "encrypt_data_miss"`（缺少加密数据）是决定性证据——
+抖音要求请求携带 `a_bogus` / `X-Bogus` / `msToken` 等**签名参数**，
+这些参数由页面上的 JS-VM 动态生成，无法用固定值或 cookies 伪造。
+
+另外确认：PyPI 上 `yt-dlp` 已是当日最新（2026.8.19），
+其抖音提取器源码中 `# TODO: Run verification challenge code to generate signature cookies`
+**依然存在**，即上游尚未实现。因此"升级引擎"也不能解决。
+
+**其它路线也验证过**：
+
+| 路线 | 结果 |
+|---|---|
+| 第三方解析服务（tikwm、douyin.wtf 等） | 本网络下请求被重置（`SSL: UNEXPECTED_EOF`），且需要引入外部依赖、隐私与稳定性风险 |
+| 无头 Chrome 渲染页面 | 反爬会检测自动化，`--dump-dom` 超时（90s 未返回） |
+| 抖音开放平台官方 API | 需要报备开发者资质，非个人工具可用路径 |
+
+**因此目前的定位是**：抖音属于"引擎上游未支持 + 站点强反爬"的双重限制，
+在不实现签名算法（或引入浏览器自动化/第三方服务）的前提下无解。
+程序的做法是**给出明确可读的提示**，而不是静默失败或让用户误以为是配置问题。
+
 ---
 
 ## 报错对照表
