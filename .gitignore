@@ -1,0 +1,44 @@
+# ---- 运行时与依赖（体积大、可重新生成，不入库）----
+runtime/
+frontend/node_modules/
+frontend/dist/
+
+# ---- 下载产物（用户数据，可能很大，不入库）----
+downloads/
+!downloads/.gitkeep
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node ----
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+
+# ---- 前端构建产物 ----
+# 说明：static/ 是 Vite 的构建输出。为了让 clone 后无需装 node 即可直接运行，
+# 这里**保留** static/ 入库；如需改为 CI 构建，取消下面两行注释即可。
+# static/
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 本地配置与临时文件 ----
+.env
+.env.local
+*.local
+*.log
+cookies.txt
+*.cookies
