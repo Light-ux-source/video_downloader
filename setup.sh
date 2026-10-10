@@ -12,7 +12,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RT="$ROOT/runtime"
+# 注意区分两个版本号：
+#   PYVER    完整版本，用于下载地址与缓存文件名
+#   PY_SERIES 大版本，用于安装包内的目录名（Versions/3.12）
+# 早期把完整版本当成目录名用，导致校验永远失败、每次都要重新下载 46MB。
 PYVER="3.12.8"
+PY_SERIES="${PYVER%.*}"
 PY_PKG_URL="${PY_PKG_URL:-https://registry.npmmirror.com/-/binary/python/${PYVER}/python-${PYVER}-macos11.pkg}"
 PY_PKG_URL_FALLBACK="https://www.python.org/ftp/python/${PYVER}/python-${PYVER}-macos11.pkg"
 PIP_INDEX="${PIP_INDEX:-https://mirrors.ustc.edu.cn/pypi/simple/}"
@@ -26,7 +31,7 @@ mkdir -p "$RT"
 # 注意：必须通过 run.sh 探活，因为 framework 里的 python3 直接执行会因
 # 找不到 dyld 依赖而 Abort，从而被误判为"运行时缺失"并触发重新解包。
 NEED_PY=1
-if [ -x "$RT/py/bin/python3" ] || [ -x "$RT/Python.framework/Versions/$PYVER/bin/python3" ]; then
+if [ -x "$RT/py/bin/python3" ] || [ -x "$RT/Python.framework/Versions/$PY_SERIES/bin/python3" ]; then
   if "$ROOT/run.sh" -m pip --version >/dev/null 2>&1; then
     NEED_PY=0
   fi
@@ -58,7 +63,7 @@ if [ "$NEED_PY" = "1" ]; then
 
   # 先校验新解包结果，确认可用后再替换旧运行时（避免把可用运行时删坏）
   NEW_PAYLOAD="$TMP/exp/Python_Framework.pkg/Payload"
-  if [ ! -x "$NEW_PAYLOAD/Versions/$PYVER/bin/python3" ]; then
+  if [ ! -x "$NEW_PAYLOAD/Versions/$PY_SERIES/bin/python3" ]; then
     # 缓存包可能损坏：删掉缓存重新下载一次
     warn "安装包解包结果异常，清除缓存后重试"
     rm -f "$CACHED_PKG" && rm -rf "$TMP/exp" "$TMP/py.pkg"
@@ -69,7 +74,7 @@ if [ "$NEED_PY" = "1" ]; then
     cp "$TMP/py.pkg" "$CACHED_PKG"
     pkgutil --expand-full "$TMP/py.pkg" "$TMP/exp"
   fi
-  if [ ! -x "$NEW_PAYLOAD/Versions/$PYVER/bin/python3" ]; then
+  if [ ! -x "$NEW_PAYLOAD/Versions/$PY_SERIES/bin/python3" ]; then
     warn "无法获得可用的 Python 运行时，请检查网络后重试：$PY_PKG_URL"
     exit 1
   fi
@@ -78,7 +83,7 @@ if [ "$NEED_PY" = "1" ]; then
   rm -rf "$RT/Python.framework" "$RT/py"
   mv "$NEW_PAYLOAD" "$RT/Python.framework"
   # 运行时的 libssl/libcrypto 是绝对路径引用，用稳定软链结构让其可被解析
-  ln -sfn "Python.framework/Versions/$PYVER" "$RT/py"
+  ln -sfn "Python.framework/Versions/$PY_SERIES" "$RT/py"
 
   info "引导 pip"
   if ! "$ROOT/run.sh" -m ensurepip --upgrade --default-pip >/dev/null 2>&1; then
