@@ -40,49 +40,71 @@ yt-dlp 源码里那行 `# TODO: Run verification challenge code to generate sign
 
 #### 本项目采用的通路（无需登录、无需用户 Cookie）
 
+**主路径：移动端 App Feed 接口**（实测免签名、免 Cookie）
+
 ```
-① 访问 douyin.com / iesdouyin.com 首页
-   → 拿到游客 Cookie（ttwid、__ac_nonce）      ← 只是设备标识，不是登录态
-② 带游客 Cookie 请求 SSR 分享页 /share/video/<数字id>/
-   → 页面内联渲染出 play_addr.uri（即 video_id，形如 v0d00fg10000...）
-③ 调 App 端旧播放直链接口
-   aweme.snssdk.com/aweme/v1/play/?video_id=<id>&ratio=<档位>
-   → 302 指向 CDN 直链（该接口不需要任何签名）
-④ 带 Referer: https://www.douyin.com/ 下载 CDN
+GET https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<数字id>
+    UA: com.ss.android.ugc.aweme/290101 (...Android...)
 ```
 
-关键点：
+这条接口的优势（实测）：
 
-- **必须带游客 Cookie 请求分享页**：不带只会拿到风控壳页——这是最容易踩的坑。
-  游客 Cookie 只要访问首页就能白拿，**用户完全无感，不需要提供任何 Cookie**。
-- **必须用 `/aweme/v1/play/`，不要用 `/aweme/v1/playwm/`**：
-  实测对比同一视频同一时间点画面：
+| 特性 | 说明 |
+|---|---|
+| 免签名免 Cookie | `status_code: 0`，直接返回该视频完整详情 |
+| 信息更全 | 带 `bit_rate[]`，每个档位都有**精确分辨率与 data_size** |
+| 可直接下载 | 档位里的 `url_list` 就是 CDN 直链，省掉一次跳转 |
+| **能精确判断"不可下载"** | 视频被删/私密/地区限制时 **`aweme_list` 为空**，据此可给出明确原因 |
+
+**兜底路径：SSR 分享页 + App 播放直链**
+
+```
+① 访问 douyin.com / iesdouyin.com 首页拿游客 Cookie（ttwid）
+   —— 只是设备标识，不是登录态
+② 带游客 Cookie 请求 /share/video/<数字id>/ → 页面内联渲染 play_addr.uri
+   （不带游客 Cookie 只会拿到风控壳页，这是最容易踩的坑）
+③ aweme.snssdk.com/aweme/v1/play/?video_id=<uri>&ratio=<档位> → 302 到 CDN 直链
+```
+
+两条路径互补：feed 的 `bit_rate` 通常最高到 720p，而播放接口能拿到 1080p，
+因此请求高画质时会用 `play_addr.uri` 再换一条更高档的直链。
+
+**关键点**：
+
+- **必须带游客 Cookie 请求分享页**（兜底路径）：不带只会拿到风控壳页。
+  游客 Cookie 访问首页就能白拿，**用户完全无感，不需要提供任何 Cookie**。
+- **必须用 `/aweme/v1/play/`，不要用 `/aweme/v1/playwm/`**：实测像素对比确认——
 
   | 接口 | 分辨率 | 水印 |
   |---|---|---|
   | `play` | **1920×1080** | **无水印** |
   | `playwm` | 1280×720（固定，ratio 参数无效） | 左上角带「抖音 + 抖音号 + 昵称」水印 |
 
-  因此 `play` 是首选，`playwm` 仅作兜底。
 - 档位映射：`best/1080 → 1080p`、`720 → 720p`、`480/360 → 540p`（接口最低档）。
-- CDN 直链有效期约 1–2 小时，因此解析与下载在同一流程内完成，不会存链接过夜。
+  请求低于最低档时取最小档，而不是退回最高档。
+- CDN 直链有效期约 1–2 小时，解析与下载在同一流程内完成。
 
-#### 已知边界
+#### 视频"不支持下载"时会发生什么
 
-| 情况 | 表现 |
+这类视频**不是程序 bug，也不是配置问题**，抖音本身就不提供可下载的视频流：
+
+| 情况 | 程序行为 |
 |---|---|
-| 公开视频 | ✅ 可下 |
-| 私密 / 仅好友可见 | ❌ 分享页不渲染数据 |
-| 已删除 / 地区限制 | ❌ 拿不到数据 |
-| 图文笔记（非视频） | ❌ 不是视频流 |
-| 直播 / 回放 | ❌ 走 live 接口，不适用 |
-| 抖音调整页面结构或下掉旧播放接口 | ❌ 通路失效，会给出明确报错 |
+| 已删除 / 不存在 | 明确提示"未返回该作品的数据……这类视频本身不支持下载" |
+| 私密 / 仅好友可见 | 同上，并优先给出对应原因 |
+| 地区限制（如海外版权限制） | 同上 |
+| 图文 / 图集笔记 | 明确提示"这是图文/图集内容，没有视频流"，不误报为视频 |
+| 直播 / 回放 | 不适用（走 live 接口） |
+
+实测：不存在的 id 会在约 2.6 秒内返回上述明确提示，**不会**再出现
+"Fresh cookies are needed"这种误导性报错，也不会冒泡成"服务内部错误"。
 
 #### 实现位置与自测
 
-- 代码：`core/douyin.py`
+- 代码：`core/douyin.py`（主路径 + 兜底路径，含原理与边界注释）
 - 接入点：`core/ytdlp.py::probe()`（解析）、`core/tasks.py::_resolve_douyin_direct()`（下载）
-- 自测：`tests/run_tests.py::test_douyin`（URL 识别、档位映射、数据提取、文件名规范化）
+- 自测：`tests/run_tests.py::test_douyin`（URL 识别、档位选择、不可用原因分类、
+  网络异常收敛与重试、文件名规范化）
 
 ---
 

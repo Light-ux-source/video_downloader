@@ -2,61 +2,87 @@
 
 背景
 ----
-yt-dlp 的抖音提取器走的是 `www.douyin.com/aweme/v1/web/aweme/detail/` 这类 Web 业务接口，
+yt-dlp 的抖音提取器走 `www.douyin.com/aweme/v1/web/aweme/detail/` 这类 Web 业务接口，
 这些接口现在要求 `a_bogus` / msToken 请求签名（实测返回 `status_code: 11110` /
-`encrypt_data_miss`，或直接 403）。yt-dlp 源码里此处仍是未实现的 TODO：
+`encrypt_data_miss`，或直接 403）。yt-dlp 源码中此处仍是未实现的 TODO：
 
     # TODO: Run verification challenge code to generate signature cookies
 
 因此直接交给 yt-dlp 必然报 `Fresh cookies (not necessarily logged in) are needed`。
 
-本项目采用的通路（**无需用户登录、无需用户提供 Cookie、无需签名算法**）
+本项目采用的通路（**无需用户登录、无需用户提供 Cookie、无需实现签名算法**）
 ------------------------------------------------------------------
-1. 访问 douyin.com / iesdouyin.com 首页，拿到**游客 Cookie**（`ttwid`、`__ac_nonce`）。
-   这只是设备标识，不代表任何账号登录态。
-2. 带上游客 Cookie 请求 SSR 分享页 `www.iesdouyin.com/share/video/<数字id>/`，
-   页面会内联渲染出视频数据，其中 `play_addr.uri` 就是 `video_id`（形如 `v0d00fg10000...`）。
-   —— 不带游客 Cookie 时该页只返回风控壳页（captcha/slardar），这是最容易踩的坑。
-3. 用 `video_id` 调 **App 端旧播放直链接口**
-   `https://aweme.snssdk.com/aweme/v1/play/?video_id=<id>&ratio=<档位>`，
-   它只校验 video_id 合法性与时间戳，**不需要任何签名**，返回 302 指向 CDN 直链。
-4. CDN（`*.douyinvod.com`）只校验 Referer，带上 `https://www.douyin.com/` 即可下载。
+主路径：**移动端 App Feed 接口**
+
+    https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<数字id>
+
+- 使用 App 形态的 UA（`com.ss.android.ugc.aweme/...`），普通浏览器 UA 会被拒
+- 实测**免签名、免 Cookie**，`status_code: 0`，直接返回该视频完整详情
+- 返回体里的 `video.bit_rate[]` 给出每个档位的**精确分辨率与 data_size**，
+  并带可直接下载的 `url_list`（比播放接口更直接，且能挑档位）
+- 关键判据：**视频不可用时 `aweme_list` 为空**——据此可精确区分
+  "视频本身不支持下载"与"接口失效"，避免给用户含糊报错
+
+兜底路径：SSR 分享页 + App 播放直链
+
+    ① 访问 douyin.com / iesdouyin.com 首页拿游客 Cookie（ttwid）
+       —— 只是设备标识，不是登录态
+    ② 带游客 Cookie 请求 /share/video/<数字id>/ → 页面内联渲染 play_addr.uri
+       （不带游客 Cookie 只会拿到风控壳页，这是最容易踩的坑）
+    ③ aweme.snssdk.com/aweme/v1/play/?video_id=<uri>&ratio=<档位> → 302 到 CDN 直链
 
 实测要点
 -------
-- 必须用 `/aweme/v1/play/`，**不要用** `/aweme/v1/playwm/`：
-  后者固定返回 720p 且带水印；前者才真正响应 ratio（540p/720p/1080p）。
-- CDN 直链有效期约 1–2 小时，因此"解析"与"下载"必须在同一流程内完成，
-  不能把链接存起来过很久再用。
+- **必须用 `play` 接口，不要用 `playwm`**：抓同一时间点画面做像素对比确认
+  `play` = 1920x1080 无水印；`playwm` = 固定 1280x720 且左上角带抖音号水印。
+- CDN 直链有效期约 1–2 小时，因此解析与下载必须在同一流程内完成。
+- 域名职责：`aweme.snssdk.com` / `api5-normal-c-hl.amemv.com` 是 App 端域名（多数免签名）；
+  `www.douyin.com/aweme/v1/web/**` 是 Web 端接口（需要签名，不要用）。
 
 边界
 ----
-- 仅支持公开视频；私密/仅好友可见拿不到 video_id。
-- 图文笔记（非视频）拿到的不是视频流。
-- 直播与直播回放不适用（走 live 接口）。
-- 抖音若下掉旧播放接口或给分享页也加签名，此通路会失效——届时会明确报错。
+- 仅支持公开视频；私密 / 仅好友可见 / 已删除 / 地区限制会返回空列表，程序会明确告知。
+- 图文笔记（图集）不是视频流，会明确提示不支持。
+- 直播与直播回放走 live 接口，不适用。
+- 若抖音给 App 端接口也加签名校验，主路径失效时会自动降级到兜底路径；
+  两条都失败才报错。
 """
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import re
+import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from typing import Any
 
-# 游客 Cookie 的获取入口（不登录，仅拿设备标识）
+# ---------------------------------------------------------------- 常量
+
+# 游客 Cookie 获取入口（不登录，仅拿设备标识）
 GUEST_COOKIE_URLS = (
     "https://www.douyin.com/",
     "https://www.iesdouyin.com/",
 )
 
+# 主路径：App 端 Feed 接口（免签名）
+MOBILE_FEED_ENDPOINTS = (
+    "https://api5-normal-c-hl.amemv.com/aweme/v1/feed/",
+    "https://aweme.snssdk.com/aweme/v1/feed/",
+)
+UA_APP = (
+    "com.ss.android.ugc.aweme/290101 (Linux; U; Android 10; zh_CN; Pixel 4; "
+    "Build/QQ3A.200805.001; Cronet/TTNetVersion:5f9037be 2023-01-13 "
+    "QuicVersion:4668bb42 2022-11-21)"
+)
+
+# 兜底路径
 SHARE_PAGE_TEMPLATE = "https://www.iesdouyin.com/share/video/{video_id}/"
 PLAY_API_TEMPLATE = (
     "https://aweme.snssdk.com/aweme/v1/play/?video_id={video_id}&ratio={ratio}&line=0"
 )
-# playwm 会带水印且固定 720p，仅作为 play 不可用时的最后兜底
+# playwm 带水印且固定 720p，仅作最后兜底
 PLAYWM_API_TEMPLATE = (
     "https://aweme.snssdk.com/aweme/v1/playwm/?video_id={video_id}&ratio={ratio}&line=0"
 )
@@ -67,7 +93,7 @@ UA_IPHONE = (
     "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
-# 画质档位 → 分享/播放接口的 ratio 参数
+# 画质预设 → 播放接口 ratio（兜底路径用）
 RATIO_BY_PRESET: dict[str, str] = {
     "best": "1080p",
     "1080": "1080p",
@@ -75,25 +101,41 @@ RATIO_BY_PRESET: dict[str, str] = {
     "480": "540p",
     "360": "540p",
 }
+# 画质预设 → 期望高度（主路径从 bit_rate 里挑档位；None 表示最高）
+HEIGHT_BY_PRESET: dict[str, int | None] = {
+    "best": None,
+    "1080": 1080,
+    "720": 720,
+    "480": 576,
+    "360": 576,
+}
 
 DOUYIN_HOST_RE = re.compile(
     r"^https?://(?:"
     r"v\.douyin\.com|"
     r"www\.douyin\.com|douyin\.com|"
-    r"www\.iesdouyin\.com|iesdouyin\.com"
+    r"www\.iesdouyin\.com|iesdouyin\.com|"
+    r"api\.douyin\.com|"
+    r"www\.amemv\.com"
     r")/",
     re.IGNORECASE,
 )
-# 数字作品 id：出现在 /video/<id>、/note/<id>、/share/video/<id>
-NUMERIC_ID_RE = re.compile(r"/(?:video|note|share/video|share/note)/(\d{6,})")
-# SSR 页面里的 video_id（play_addr.uri）
+NUMERIC_ID_RE = re.compile(
+    r"/(?:video|note|slides|share/video|share/note|share/slides)/(\d{6,})"
+)
 VIDEO_URI_RE = re.compile(r'"play_addr":\{"uri":"(v0[0-9a-zA-Z]+)"')
-# 分享页里的标题
 DESC_RE = re.compile(r'"desc":"(.*?)","create_time"')
 
 
 class DouyinError(RuntimeError):
     """抖音提取失败（消息面向用户，可直接展示）。"""
+
+
+class DouyinUnavailable(DouyinError):
+    """视频本身不可下载（已删除 / 地区限制 / 私密 / 仅部分可见）。"""
+
+
+# ---------------------------------------------------------------- URL 判定
 
 
 def is_douyin_url(url: str) -> bool:
@@ -104,7 +146,16 @@ def ratio_for_preset(preset: str | None) -> str:
     return RATIO_BY_PRESET.get(str(preset or "best"), "1080p")
 
 
-def _build_opener(proxy: str | None, jar: http.cookiejar.CookieJar) -> urllib.request.OpenerDirector:
+def height_for_preset(preset: str | None) -> int | None:
+    return HEIGHT_BY_PRESET.get(str(preset or "best"))
+
+
+# ---------------------------------------------------------------- HTTP 基础
+
+
+def _build_opener(
+    proxy: str | None, jar: http.cookiejar.CookieJar
+) -> urllib.request.OpenerDirector:
     handlers: list[Any] = [urllib.request.HTTPCookieProcessor(jar)]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
@@ -122,6 +173,7 @@ def _request(
     opener: urllib.request.OpenerDirector,
     url: str,
     *,
+    ua: str = UA_IPHONE,
     follow: bool = True,
     referer: str | None = None,
     timeout: int = 25,
@@ -131,7 +183,9 @@ def _request(
             *[h for h in opener.handlers if not isinstance(h, urllib.request.HTTPRedirectHandler)],
             _NoRedirect(),
         )
-    headers = {"User-Agent": UA_IPHONE, "Accept-Language": "zh-CN,zh;q=0.9"}
+    headers = {"User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9"}
+    if "aweme" in url or "amemv" in url:
+        headers["Accept"] = "application/json"
     if referer:
         headers["Referer"] = referer
     request = urllib.request.Request(url, headers=headers)
@@ -143,12 +197,34 @@ def _request(
         return exc.code, body, dict(exc.headers or {})
     except urllib.error.URLError as exc:
         raise DouyinError(f"网络请求失败：{exc.reason}") from exc
+    except http.client.HTTPException as exc:
+        # 例如 IncompleteRead：响应体被中途截断（代理/网络抖动）
+        raise DouyinError(f"网络传输中断：{exc}") from exc
     except OSError as exc:
         raise DouyinError(f"网络请求失败：{exc}") from exc
 
 
+def _request_with_retry(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    *,
+    attempts: int = 3,
+    **kwargs: Any,
+) -> tuple[int, bytes, dict[str, str]]:
+    """带重试的请求：网络抖动（截断/超时）在真实环境里很常见。"""
+    last: DouyinError | None = None
+    for attempt in range(attempts):
+        try:
+            return _request(opener, url, **kwargs)
+        except DouyinError as exc:
+            last = exc
+            if attempt < attempts - 1:
+                time.sleep(0.5 * (attempt + 1))
+    raise last or DouyinError("网络请求失败")
+
+
 def warm_guest_cookies(opener: urllib.request.OpenerDirector) -> None:
-    """访问首页获取游客 Cookie（失败不致命，分享页可能仍可渲染）。"""
+    """访问首页获取游客 Cookie（失败不致命）。"""
     for url in GUEST_COOKIE_URLS:
         try:
             _request(opener, url, timeout=15)
@@ -156,46 +232,269 @@ def warm_guest_cookies(opener: urllib.request.OpenerDirector) -> None:
             continue
 
 
-def resolve_numeric_id(
-    opener: urllib.request.OpenerDirector, url: str
-) -> str:
+# ---------------------------------------------------------------- 数字 id
+
+
+def resolve_numeric_id(opener: urllib.request.OpenerDirector, url: str) -> str:
     """从抖音链接中取出数字作品 id（短链需要跟随 302）。"""
     match = NUMERIC_ID_RE.search(url)
     if match:
         return match.group(1)
 
     if "v.douyin.com" in url:
-        status, _, headers = _request(opener, url, follow=False, timeout=20)
+        _, _, headers = _request(opener, url, follow=False, timeout=20)
         location = headers.get("Location") or ""
-        if not location:
-            # 有的实现不给 Location 而是直接 200 渲染，试着从正文里找
-            status, body, _ = _request(opener, url, timeout=25)
-            found = NUMERIC_ID_RE.search(body.decode("utf-8", "replace"))
-            if found:
-                return found.group(1)
-            raise DouyinError("短链未能跳转到视频页，请改用完整链接（含 /video/<id>）")
-        match = NUMERIC_ID_RE.search(location)
+        if location:
+            match = NUMERIC_ID_RE.search(location)
+            if match:
+                return match.group(1)
+            raise DouyinError(f"短链跳转结果无法识别：{location[:120]}")
+        _, body, _ = _request(opener, url, timeout=25)
+        match = NUMERIC_ID_RE.search(body.decode("utf-8", "replace"))
         if match:
             return match.group(1)
-        raise DouyinError(f"短链跳转结果无法识别：{location[:120]}")
+        raise DouyinError("短链未能跳转到视频页；请改用完整链接（含 /video/<id>）")
 
-    raise DouyinError("未能从链接中识别抖音作品 id，请使用 /video/<id> 形式的链接")
+    if "/collection/" in url or "/mix/" in url:
+        raise DouyinError("这是合集链接。请打开合集里的单个视频，用那个视频链接下载")
+    raise DouyinError("未能从链接中识别作品 id；请使用 /video/<id> 或 /note/<id> 形式的链接")
+
+
+# ---------------------------------------------------------------- 主路径：Feed
+
+
+def _feed_items(
+    opener: urllib.request.OpenerDirector, numeric_id: str
+) -> list[dict[str, Any]]:
+    """调 App 端 Feed 接口，返回 aweme_list（接口不可用则抛 DouyinError）。"""
+    errors: list[str] = []
+    for endpoint in MOBILE_FEED_ENDPOINTS:
+        url = f"{endpoint}?aweme_id={numeric_id}&count=10"
+        status, body = 0, b""
+        # 网络抖动（截断/超时）很常见，同一接口最多重试 3 次再换域名
+        for attempt in range(3):
+            try:
+                status, body, _ = _request(
+                    opener, url, ua=UA_APP, referer=CDN_REFERER, timeout=25
+                )
+                break
+            except DouyinError as exc:
+                if attempt == 2:
+                    errors.append(str(exc))
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+        if status != 200:
+            if status:
+                errors.append(f"HTTP {status}")
+            continue
+        text = body.decode("utf-8", "replace")
+        if not text.strip():
+            errors.append("空响应")
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            errors.append("响应非 JSON")
+            continue
+        items = data.get("aweme_list") or []
+        if items:
+            return items
+        # 接口通但列表为空 → 交给上层判定"视频不可用"
+        return []
+    raise DouyinError("App 端 Feed 接口不可用（" + "；".join(errors[:2]) + "）")
+
+
+def _pick_bitrate(video: dict[str, Any], want_height: int | None) -> dict[str, Any] | None:
+    """从 bit_rate 数组里挑最合适的档位（带精确分辨率与直连 url_list）。"""
+    rates = [
+        r for r in (video.get("bit_rate") or [])
+        if (r.get("play_addr") or {}).get("url_list")
+    ]
+    if not rates:
+        return None
+
+    def height_of(rate: dict[str, Any]) -> int:
+        return int((rate.get("play_addr") or {}).get("height") or 0)
+
+    if want_height:
+        fits = [r for r in rates if 0 < height_of(r) <= want_height]
+        if fits:
+            return max(fits, key=height_of)
+        # 全部档位都高于目标（例如只想要 360p 但最低就是 576p）→ 取最小档，
+        # 而不是退回最高档，避免"选省流量却下了最大文件"。
+        return min(rates, key=height_of)
+    return max(rates, key=height_of)
+
+
+def _classify_unavailable(filter_list: Any, numeric_id: str) -> str:
+    """把"列表为空"翻译成用户能理解的原因。"""
+    text = json.dumps(filter_list or [], ensure_ascii=False).lower()
+    if "删除" in text or "delete" in text or "not exist" in text:
+        return "该视频已被删除或不存在"
+    if "地区" in text or "region" in text or "country" in text:
+        return "该视频在当前网络所在地区不可播放（地区限制）"
+    if "私密" in text or "private" in text or "friend" in text:
+        return "该视频为私密内容或仅好友可见，无法下载"
+    return (
+        "抖音未返回该视频数据：可能已被删除、设为私密、仅部分可见或存在地区限制。"
+        "这类视频本身不支持下载。"
+    )
+
+
+def _first_url(container: Any) -> str | None:
+    if not isinstance(container, dict):
+        return None
+    urls = container.get("url_list") or []
+    return urls[0] if urls else None
+
+
+def _human(num: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(num)
+    idx = 0
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024
+        idx += 1
+    return f"{value:.1f}{units[idx]}" if idx else f"{int(value)}B"
+
+
+def _extract_via_feed(
+    opener: urllib.request.OpenerDirector, numeric_id: str, preset: str | None
+) -> dict[str, Any] | None:
+    """主路径。返回 None 表示应降级到兜底路径。"""
+    items = _feed_items(opener, numeric_id)
+
+    target = None
+    for item in items:
+        if str(item.get("aweme_id")) == str(numeric_id):
+            target = item
+            break
+    if target is None:
+        if not items:
+            raise DouyinUnavailable(_classify_unavailable(None, numeric_id))
+        # 接口正常返回了推荐数据，但其中没有目标 id：
+        # 说明该作品不可访问（已删除 / 私密 / 仅部分可见 / 地区限制）。
+        # 此时不应再降级到分享页（那里只会撞风控，给出误导性报错）。
+        raise DouyinUnavailable(
+            "抖音未返回该作品的数据：它可能已被删除、设为私密、仅部分可见或存在地区限制，"
+            "这类视频本身不支持下载。"
+        )
+
+    # 图集（图文笔记）：不是视频流
+    if target.get("images"):
+        raise DouyinError(
+            f"这是一条图文/图集内容（{len(target['images'])} 张图），没有视频流，"
+            "抖音图集暂不支持下载。"
+        )
+
+    video = target.get("video") or {}
+    if not video:
+        raise DouyinUnavailable("该内容没有视频流（可能已被删除或设为不可播放）")
+
+    picked = _pick_bitrate(video, height_for_preset(preset))
+    play_addr = (picked or {}).get("play_addr") or (video.get("play_addr") or {})
+    url_list = [u for u in (play_addr.get("url_list") or []) if u]
+    if not url_list:
+        return None  # 没有直连地址 → 降级
+
+    height = play_addr.get("height")
+    width = play_addr.get("width")
+    data_size = play_addr.get("data_size")
+    direct_url = url_list[0]
+
+    formats: list[dict[str, Any]] = []
+    for rate in video.get("bit_rate") or []:
+        addr = rate.get("play_addr") or {}
+        if not addr.get("url_list"):
+            continue
+        h, w, size = addr.get("height"), addr.get("width"), addr.get("data_size")
+        formats.append({
+            "format_id": f"douyin-{h}p" if h else str(rate.get("gear_name") or "douyin"),
+            "label": f"{h}p · mp4（抖音直链）" if h else "mp4（抖音直链）",
+            "ext": "mp4",
+            "height": h,
+            "width": w,
+            "fps": None,
+            "vcodec": "h264",
+            "acodec": "aac",
+            "abr": None,
+            "tbr": None,
+            "filesize": size,
+            "filesize_text": _human(int(size)) if size else None,
+            "has_video": True,
+            "has_audio": True,
+            "is_audio_only": False,
+            "note": str(rate.get("gear_name") or ""),
+            "protocol": "https",
+        })
+    formats.sort(key=lambda f: f.get("height") or 0, reverse=True)
+
+    # 互补：feed 的 bit_rate 通常只到 720p，而播放直链接口能给到更高档。
+    # 用户要更高画质时，用 play_addr.uri 换一条更高分辨率的直链。
+    video_uri = (video.get("play_addr") or {}).get("uri")
+    want_height = height_for_preset(preset)
+    max_feed_height = max((f.get("height") or 0) for f in formats) if formats else 0
+    chosen_ratio = f"{height}p" if height else ratio_for_preset(preset)
+    if video_uri and (want_height is None or want_height > max_feed_height):
+        wanted_ratio = ratio_for_preset(preset)
+        try:
+            better = play_url_for(opener, video_uri, wanted_ratio)
+            if better:
+                direct_url = better
+                chosen_ratio = wanted_ratio  # 记录实际选中的档位
+        except DouyinError:
+            pass  # 拿不到更高档就用 feed 的直链，不影响可用性
+
+    if not formats:
+        formats = [{
+            "format_id": "douyin", "label": "mp4（抖音直链）", "ext": "mp4",
+            "height": height, "width": width, "fps": None, "vcodec": "h264", "acodec": "aac",
+            "abr": None, "tbr": None, "filesize": data_size,
+            "filesize_text": _human(int(data_size)) if data_size else None,
+            "has_video": True, "has_audio": True, "is_audio_only": False,
+            "note": "", "protocol": "https",
+        }]
+
+    return {
+        "kind": "video",
+        "url": f"https://www.douyin.com/video/{numeric_id}",
+        "id": numeric_id,
+        "title": (target.get("desc") or "").strip() or f"douyin_{numeric_id}",
+        "uploader": (target.get("author") or {}).get("nickname"),
+        "extractor": "Douyin (VideoHarbor 直连)",
+        "duration": (video.get("duration") or 0) // 1000 or None,
+        "duration_text": None,
+        "thumbnail": _first_url(video.get("cover")) or _first_url(target.get("cover")),
+        "description": "",
+        "view_count": (target.get("statistics") or {}).get("play_count"),
+        "like_count": (target.get("statistics") or {}).get("digg_count"),
+        "upload_date": None,
+        "is_live": False,
+        "has_subtitles": False,
+        "subtitle_langs": [],
+        "formats": formats,
+        "presets": [],
+        "direct_url": direct_url,
+        "direct_headers": {"Referer": CDN_REFERER, "User-Agent": UA_APP},
+        "ratio": chosen_ratio,
+        "video_id": (video.get("play_addr") or {}).get("uri"),
+        "note": "抖音：已通过 App 端免 Cookie 接口解析（无水印原画，yt-dlp 的抖音提取器不可用）",
+    }
+
+
+# ---------------------------------------------------------------- 兜底路径
 
 
 def fetch_share_page(opener: urllib.request.OpenerDirector, numeric_id: str) -> str:
     """请求 SSR 分享页；必须已带游客 Cookie，否则只会拿到风控壳页。"""
     url = SHARE_PAGE_TEMPLATE.format(video_id=numeric_id)
-    status, body, _ = _request(opener, url, timeout=25)
+    status, body, _ = _request_with_retry(opener, url, timeout=25)
     html = body.decode("utf-8", "replace")
     if status != 200:
         raise DouyinError(f"分享页返回 HTTP {status}")
     if "play_addr" not in html:
-        # 区分"视频不存在"与"被风控"
         if "_$jsvmprt" in html or "captcha" in html:
-            raise DouyinError(
-                "抖音分享页触发了风控（未渲染视频数据）。"
-                "请稍后重试；若持续失败说明该通路可能已被封堵。"
-            )
+            raise DouyinError("抖音分享页触发了风控（未渲染视频数据），该兜底路径暂不可用")
         raise DouyinError("分享页未包含视频数据（可能是图文笔记、私密视频或已被删除）")
     return html
 
@@ -207,15 +506,15 @@ def extract_video_id(html: str) -> str:
     return match.group(1)
 
 
-def play_url_for(
-    opener: urllib.request.OpenerDirector, video_id: str, ratio: str
-) -> str:
-    """用 video_id 换 CDN 直链（302 的 Location）。"""
+def play_url_for(opener: urllib.request.OpenerDirector, video_id: str, ratio: str) -> str:
+    """用 video_id 换 CDN 直链（302 的 Location）。play 无水印优先，playwm 兜底。"""
     errors: list[str] = []
     for template, label in ((PLAY_API_TEMPLATE, "play"), (PLAYWM_API_TEMPLATE, "playwm")):
         url = template.format(video_id=video_id, ratio=ratio)
         try:
-            status, _, headers = _request(opener, url, follow=False, referer=CDN_REFERER)
+            status, _, headers = _request_with_retry(
+                opener, url, follow=False, referer=CDN_REFERER
+            )
         except DouyinError as exc:
             errors.append(f"{label}: {exc}")
             continue
@@ -226,6 +525,57 @@ def play_url_for(
     raise DouyinError("播放接口未返回直链（" + "；".join(errors[:2]) + "）")
 
 
+def _extract_via_share(
+    opener: urllib.request.OpenerDirector, numeric_id: str, preset: str | None
+) -> dict[str, Any]:
+    """兜底路径：分享页取 video_id + 播放接口换直链。"""
+    html = fetch_share_page(opener, numeric_id)
+    video_id = extract_video_id(html)
+
+    desc = DESC_RE.search(html)
+    title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
+
+    ratio = ratio_for_preset(preset)
+    direct_url = play_url_for(opener, video_id, ratio)
+
+    return {
+        "kind": "video",
+        "url": f"https://www.douyin.com/video/{numeric_id}",
+        "id": numeric_id,
+        "title": title,
+        "uploader": None,
+        "extractor": "Douyin (VideoHarbor 直连)",
+        "duration": None,
+        "duration_text": None,
+        "thumbnail": None,
+        "description": "",
+        "view_count": None,
+        "like_count": None,
+        "upload_date": None,
+        "is_live": False,
+        "has_subtitles": False,
+        "subtitle_langs": [],
+        "formats": [{
+            "format_id": f"douyin-{ratio}", "label": f"{ratio} · mp4（抖音直链）", "ext": "mp4",
+            "height": None, "width": None, "fps": None, "vcodec": "h264", "acodec": "aac",
+            "abr": None, "tbr": None, "filesize": None, "filesize_text": None,
+            "has_video": True, "has_audio": True, "is_audio_only": False,
+            "note": "音视频已混流，无需合流", "protocol": "https",
+        }],
+        "presets": [],
+        "direct_url": direct_url,
+        # CDN 直链 basename 是无意义串（形如 okf9nyEj..mp4），而 yt-dlp 不会从
+        # HTTP 头取文件名，因此文件名在下载完成后由 tasks._rename_to_title() 重命名。
+        "direct_headers": {"Referer": CDN_REFERER, "User-Agent": UA_IPHONE},
+        "ratio": ratio,
+        "video_id": video_id,
+        "note": "抖音：已通过免 Cookie 直连通路解析（yt-dlp 的抖音提取器不可用）",
+    }
+
+
+# ---------------------------------------------------------------- 对外入口
+
+
 def extract(
     url: str,
     *,
@@ -234,7 +584,7 @@ def extract(
 ) -> dict[str, Any]:
     """解析抖音视频，返回与 yt-dlp 归一化结果同构的 dict。
 
-    失败抛 DouyinError（消息可直接展示给用户）。
+    失败抛 DouyinError（消息可直接展示）；视频本身不可下载抛 DouyinUnavailable。
     """
     if not is_douyin_url(url):
         raise DouyinError("不是抖音链接")
@@ -244,75 +594,26 @@ def extract(
     warm_guest_cookies(opener)
 
     numeric_id = resolve_numeric_id(opener, url)
-    html = fetch_share_page(opener, numeric_id)
-    video_id = extract_video_id(html)
 
-    desc = DESC_RE.search(html)
-    title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
+    # 主路径：App 端 Feed 接口（免签名、更稳，且带精确档位信息）
+    feed_error: DouyinError | None = None
+    try:
+        info = _extract_via_feed(opener, numeric_id, preset)
+        if info is not None:
+            return info
+    except DouyinUnavailable:
+        raise
+    except DouyinError as exc:
+        feed_error = exc  # 主路径失效 → 记录后降级
 
-    # 分享页里内联的元信息（拿不到就用默认值）
-    duration: float | None = None
-    cover: str | None = None
-    match = re.search(r'"video":\{"play_addr".*?"duration":(\d+)', html)
-    if match:
-        duration = round(int(match.group(1)) / 1000, 3) if int(match.group(1)) > 1000 else int(match.group(1))
-    match = re.search(r'"cover":\{"uri":"[^"]*","url_list":\["(https:[^"]+)"', html)
-    if match:
-        cover = match.group(1).encode().decode("unicode_escape").replace("\\u002F", "/")
-
-    ratio = ratio_for_preset(preset)
-    direct_url = play_url_for(opener, video_id, ratio)
-
-    return {
-        "kind": "video",
-        "url": url,
-        "id": numeric_id,
-        "title": title,
-        "uploader": None,
-        "extractor": "Douyin (VideoHarbor 直连)",
-        "duration": duration,
-        "duration_text": None,
-        "thumbnail": cover,
-        "description": "",
-        "view_count": None,
-        "like_count": None,
-        "upload_date": None,
-        "is_live": False,
-        "has_subtitles": False,
-        "subtitle_langs": [],
-        # 抖音直链是单一 mp4（音视频已混流），因此只给一个"格式"
-        "formats": [
-            {
-                "format_id": f"douyin-{ratio}",
-                "label": f"{ratio} · mp4（抖音直链）",
-                "ext": "mp4",
-                "height": None,
-                "width": None,
-                "fps": None,
-                "vcodec": "h264",
-                "acodec": "aac",
-                "abr": None,
-                "tbr": None,
-                "filesize": None,
-                "filesize_text": None,
-                "has_video": True,
-                "has_audio": True,
-                "is_audio_only": False,
-                "note": "音视频已混流，无需合流",
-                "protocol": "https",
-            }
-        ],
-        "presets": [],
-        # 供下载流程使用
-        "direct_url": direct_url,
-        # 注意：CDN 直链的 basename 是无意义串（形如 okf9nyEj..mp4），
-        # 而 yt-dlp 不会从 HTTP 头取文件名，因此文件名在下载完成后由
-        # tasks._rename_to_title() 按标题重命名。
-        "direct_headers": {"Referer": CDN_REFERER, "User-Agent": UA_IPHONE},
-        "ratio": ratio,
-        "video_id": video_id,
-        "note": "抖音：已通过免 Cookie 直连通路解析（yt-dlp 的抖音提取器不可用）",
-    }
+    # 兜底路径：SSR 分享页 + 播放直链接口
+    try:
+        return _extract_via_share(opener, numeric_id, preset)
+    except DouyinError as share_error:
+        # 两条路径都失败：把主路径的原因一并带上，便于判断是"接口变了"还是"视频不可用"
+        if feed_error:
+            raise DouyinError(f"{share_error}（另一条通路：{feed_error}）") from share_error
+        raise
 
 
 def probe_summary(info: dict[str, Any]) -> str:

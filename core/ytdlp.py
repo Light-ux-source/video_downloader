@@ -695,11 +695,16 @@ def probe(url: str, opts: dict[str, Any] | None = None, timeout: int | None = No
     # 抖音：yt-dlp 的提取器撞签名墙（encrypt_data_miss / 403），
     # 改走专用免 Cookie 直连通路（见 core/douyin.py 的说明）。
     if douyin.is_douyin_url(target_url):
-        info = douyin.extract(
-            target_url,
-            preset=opts.get("preset"),
-            proxy=sanitize_proxy(str(opts["proxy"])) if opts.get("proxy") else None,
-        )
+        try:
+            info = douyin.extract(
+                target_url,
+                preset=opts.get("preset"),
+                proxy=sanitize_proxy(str(opts["proxy"])) if opts.get("proxy") else None,
+            )
+        except douyin.DouyinError as exc:
+            # 抖音的失败原因（含"该视频本身不支持下载"）直接作为业务错误返回，
+            # 不要让它冒泡成"服务内部错误"，否则用户会以为是程序坏了。
+            raise EngineError(str(exc)) from exc
         if url_note:
             info["note"] = f"{url_note}；{info.get('note', '')}".strip("；")
         return info

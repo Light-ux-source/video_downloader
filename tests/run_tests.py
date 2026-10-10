@@ -259,6 +259,7 @@ def test_douyin(tmp: Path) -> None:
         "https://www.douyin.com/note/7694879952763751680",
         "https://v.douyin.com/aAQgycBvBp0/",
         "https://www.iesdouyin.com/share/video/7694879952763751680/",
+        "https://www.douyin.com/video/7694879952763751680",
     ):
         check(f"识别为抖音：{url[:46]}", douyin.is_douyin_url(url))
     for url in (
@@ -287,6 +288,85 @@ def test_douyin(tmp: Path) -> None:
         check("缺少 play_addr 时报错", False)
     except douyin.DouyinError:
         check("缺少 play_addr 时报错", True)
+
+    section("抖音档位选择")
+    fake_video = {
+        "bit_rate": [
+            {"gear_name": "720_2_1", "play_addr": {"height": 720, "width": 1280, "data_size": 14_500_000,
+                                                   "url_list": ["https://cdn/720.mp4"]}},
+            {"gear_name": "1080_1_1", "play_addr": {"height": 1080, "width": 1920, "data_size": 49_000_000,
+                                                     "url_list": ["https://cdn/1080.mp4"]}},
+            {"gear_name": "540_1_1", "play_addr": {"height": 576, "width": 1024, "data_size": 10_000_000,
+                                                   "url_list": ["https://cdn/540.mp4"]}},
+        ]
+    }
+    best = douyin._pick_bitrate(fake_video, None)
+    check("best 选最高档", best["play_addr"]["height"] == 1080, f"→ {best['play_addr']['height']}")
+    p720 = douyin._pick_bitrate(fake_video, 720)
+    check("720 选不高于目标的最大档", p720["play_addr"]["height"] == 720, f"→ {p720['play_addr']['height']}")
+    p480 = douyin._pick_bitrate(fake_video, 480)
+    check("低于最低档时回退到最小档", p480["play_addr"]["height"] == 576, f"→ {p480['play_addr']['height']}")
+    check("无 bit_rate 时返回 None", douyin._pick_bitrate({}, None) is None)
+    check("bit_rate 无直链时返回 None",
+          douyin._pick_bitrate({"bit_rate": [{"play_addr": {"height": 720}}]}, None) is None)
+
+    section("抖音网络异常处理")
+    # IncompleteRead 等传输层异常必须被收敛成 DouyinError（可重试），不能冒泡成 500
+    import http.client as _hc
+    import urllib.error as _ue
+    import urllib.request as _ur
+
+    class _BoomOpener:
+        handlers: list = []
+
+        def open(self, *_a, **_k):
+            raise _hc.IncompleteRead(b"x" * 319542, 41955)
+
+    try:
+        douyin._request(_BoomOpener(), "https://api5-normal-c-hl.amemv.com/aweme/v1/feed/")
+        check("传输中断被收敛为 DouyinError", False, "未抛出")
+    except douyin.DouyinError as exc:
+        check("传输中断被收敛为 DouyinError", "传输中断" in str(exc), f"→ {exc}")
+    except Exception as exc:  # noqa: BLE001
+        check("传输中断被收敛为 DouyinError", False, f"抛出了 {type(exc).__name__}")
+
+    class _UrlBoomOpener:
+        handlers: list = []
+
+        def open(self, *_a, **_k):
+            raise _ue.URLError("connection reset")
+
+    try:
+        douyin._request(_UrlBoomOpener(), "https://api5-normal-c-hl.amemv.com/x")
+        check("URLError 被收敛为 DouyinError", False, "未抛出")
+    except douyin.DouyinError as exc:
+        check("URLError 被收敛为 DouyinError", "网络请求失败" in str(exc), f"→ {exc}")
+
+    # 重试包装：一直失败时最终抛 DouyinError，且尝试了指定次数
+    calls = {"n": 0}
+
+    class _AlwaysFail:
+        handlers: list = []
+
+        def open(self, *_a, **_k):
+            calls["n"] += 1
+            raise _hc.IncompleteRead(b"", 1)
+
+    try:
+        douyin._request_with_retry(_AlwaysFail(), "https://x", attempts=3)
+        check("重试包装最终抛错", False)
+    except douyin.DouyinError:
+        check("重试包装最终抛错", True)
+    check("重试次数符合预期", calls["n"] == 3, f"→ {calls['n']} 次")
+
+    section("抖音不可用原因分类")
+    check("删除类给出对应提示", "删除" in douyin._classify_unavailable([{"reason": "已删除"}], "1"))
+    check("地区类给出对应提示", "地区" in douyin._classify_unavailable([{"reason": "region limit"}], "1"))
+    check("私密类给出对应提示", "私密" in douyin._classify_unavailable([{"reason": "private"}], "1"))
+    generic = douyin._classify_unavailable(None, "1")
+    check("未知情况有兜底说明", "不支持下载" in generic, f"→ {generic[-24:]}")
+    check("DouyinUnavailable 是 DouyinError 子类",
+          issubclass(douyin.DouyinUnavailable, douyin.DouyinError))
 
     section("抖音文件名规范化")
     manager = TaskManager(concurrency=1)

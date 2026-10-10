@@ -85,15 +85,24 @@
 
 yt-dlp 的抖音提取器撞签名墙（`encrypt_data_miss` / 403），因此单独实现一条通路：
 
+采用**双路径**设计：
+
 ```
-首页拿游客 Cookie（ttwid）→ SSR 分享页取 video_id → App 端旧播放接口换 CDN 直链 → 带 Referer 下载
+主路径（免签名，更稳、信息更全）：
+  App Feed 接口 aweme/v1/feed/?aweme_id=<id>
+  → 返回 bit_rate[]（精确分辨率 + 体积 + 直连 url_list）
+  → aweme_list 为空即可判定"该视频本身不支持下载"
+
+兜底路径（主路径失效时自动降级）：
+  首页拿游客 Cookie（ttwid）→ SSR 分享页取 video_id → App 播放接口换 CDN 直链 → 带 Referer 下载
 ```
 
 - 不依赖用户登录态与 Cookie，也不需要实现 `a_bogus` 签名
-- 只用 `/aweme/v1/play/`（无水印原画）；`playwm` 固定 720p 且带水印，仅作兜底
-- 档位映射：`best/1080→1080p`、`720→720p`、`480/360→540p`
-- 失败抛 `DouyinError`，消息可直接展示；调用方（probe / tasks）会把真实原因写进日志，
-  避免被 yt-dlp 上游的模糊报错误导
+- 只用 `/aweme/v1/play/`（无水印原画）；`playwm` 固定 720p 且带水印，仅作最后兜底
+- 档位映射：`best/1080→1080p`、`720→720p`、`480/360→540p`；低于最低档时取最小档
+- 主路径的 `bit_rate` 通常最高 720p，请求更高画质时会用播放接口补一条 1080p 直链
+- 失败抛 `DouyinError`（视频本身不可下载时抛其子类 `DouyinUnavailable`），
+  消息可直接展示；调用方把原因写进日志/错误里，避免被 yt-dlp 上游的模糊报错误导
 
 详见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#抖音已支持免-cookie-直连通道)。
 
