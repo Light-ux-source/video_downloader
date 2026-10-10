@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core import config, douyin, server, ytdlp  # noqa: E402
+from core.tasks import _safe_folder_name  # noqa: E402
 from core.tasks import (  # noqa: E402
     STATE_CANCELED,
     STATE_DONE,
@@ -367,6 +368,59 @@ def test_douyin(tmp: Path) -> None:
     check("未知情况有兜底说明", "不支持下载" in generic, f"→ {generic[-24:]}")
     check("DouyinUnavailable 是 DouyinError 子类",
           issubclass(douyin.DouyinUnavailable, douyin.DouyinError))
+
+    section("抖音图文帖（图集）")
+    # 真实分享页里 images 数组的结构（已转义 /，需还原）
+    gallery_html = (
+        '{"aweme_id":"7694626674918563314"},"desc":"#厦门","create_time":1,'
+        '"nickname":"测试作者","digg_count":41776,'
+        '"images":['
+        '{"uri":"a","width":1000,"height":1573,'
+        '"url_list":["https:\\u002F\\u002Fp5.douyinpic.com\\u002Fx~tplv-dy-lqen-new:1000:1573:q80.webp?biz_tag=aweme_images",'
+        '"https:\\u002F\\u002Fp5.douyinpic.com\\u002Fx~tplv-dy-lqen-new:1000:1573:q80.jpeg?biz_tag=aweme_images"],'
+        '"download_url_list":["https:\\u002F\\u002Fp5.douyinpic.com\\u002Fx~tplv-dy-lqen-new-water:1000:1573:q80.jpeg"]},'
+        '{"uri":"b","width":1080,"height":1440,'
+        '"url_list":["https:\\u002F\\u002Fp3.douyinpic.com\\u002Fy~tplv-dy-lqen-new:1080:1440:q80.jpeg?biz_tag=aweme_images"]}'
+        ']}'
+    )
+    imgs = douyin.parse_images_array(gallery_html)
+    check("能从分享页提取 images 数组", imgs is not None and len(imgs) == 2, f"→ {imgs and len(imgs)}")
+
+    ranked = douyin.rank_image_urls(imgs[0]["url_list"])
+    check("jpeg 原图排在最前（无水印）", ".jpeg?" in ranked[0], f"→ {ranked[0][-60:]}")
+    check("webp 作为备选保留", any(".webp?" in u for u in ranked))
+    check("不使用带水印的 download_url_list",
+          all("-water" not in u for u in ranked), f"→ {[u[-40:] for u in ranked]}")
+
+    check("扩展名识别 jpeg", douyin.image_extension(ranked[0]) == "jpeg")
+    check("扩展名识别 webp", douyin.image_extension("https://x/a.webp?y=1") == "webp")
+    check("未知扩展名回退 jpg", douyin.image_extension("https://x/a") == "jpg")
+    check("空链接列表返回空", douyin.rank_image_urls(None) == [] and douyin.rank_image_urls([]) == [])
+    check("非图文页面返回 None", douyin.parse_images_array('{"video":{}}') is None)
+
+    gallery = douyin.extract_gallery(gallery_html, "7694626674918563314")
+    check("构造出图集结果", gallery is not None and gallery["kind"] == "gallery")
+    check("图集条目数正确", gallery["image_count"] == 2, f"→ {gallery['image_count']}")
+    check("图集标题/作者/点赞解析", gallery["title"] == "#厦门"
+          and gallery["uploader"] == "测试作者" and gallery["like_count"] == 41776,
+          f"→ {gallery['title']!r} {gallery['uploader']!r} {gallery['like_count']}")
+    check("每个图集条目带 url/ext/尺寸",
+          all(i.get("url") and i.get("ext") and i.get("width") for i in gallery["images"]))
+    check("图集 formats 逐张列出",
+          len(gallery["formats"]) == 2 and gallery["formats"][0]["format_id"] == "douyin-image-1")
+    check("图集不使用 direct_url（走原生下载）", "direct_url" not in gallery)
+    check("纯视频页面不会被当成图集",
+          douyin.extract_gallery('{"play_addr":{"uri":"v0abc"}}', "1") is None)
+
+    # 关键回归：feed 接口对图文帖只返回推荐流，绝不能因此判定"作品不可下载"
+    manager_gal = TaskManager(concurrency=1)
+    gal_task = manager_gal.create("https://www.douyin.com/note/7694626674918563314",
+                                 {"preset": "best"})
+    gal_task.title = "#厦门"
+    manager_gal.shutdown()
+    check("图集目录名安全化", _safe_folder_name('#厦门/测试') == "#厦门_测试",
+          f"→ {_safe_folder_name('#厦门/测试')}")
+    check("空标题有兜底目录名", _safe_folder_name("") == "douyin")
 
     section("抖音文件名规范化")
     manager = TaskManager(concurrency=1)

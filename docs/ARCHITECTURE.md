@@ -101,6 +101,10 @@ yt-dlp 的抖音提取器撞签名墙（`encrypt_data_miss` / 403），因此单
 - 只用 `/aweme/v1/play/`（无水印原画）；`playwm` 固定 720p 且带水印，仅作最后兜底
 - 档位映射：`best/1080→1080p`、`720→720p`、`480/360→540p`；低于最低档时取最小档
 - 主路径的 `bit_rate` 通常最高 720p，请求更高画质时会用播放接口补一条 1080p 直链
+- **图文帖（图集）**：Feed 接口不返回目标数据，改由分享页的 `images` 数组解析；
+  优选 `url_list` 的 `.jpeg` 原图（实测无水印），排除带 `-water` 模板的 `download_url_list`；
+  下载不走 yt-dlp（图片不是流媒体），由 `tasks._download_douyin_gallery()` 原生逐张抓取，
+  产物落在 `downloads/{标题}/图片N.ext`
 - 失败抛 `DouyinError`（视频本身不可下载时抛其子类 `DouyinUnavailable`），
   消息可直接展示；调用方把原因写进日志/错误里，避免被 yt-dlp 上游的模糊报错误导
 

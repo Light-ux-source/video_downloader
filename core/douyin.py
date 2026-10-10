@@ -125,6 +125,8 @@ NUMERIC_ID_RE = re.compile(
 )
 VIDEO_URI_RE = re.compile(r'"play_addr":\{"uri":"(v0[0-9a-zA-Z]+)"')
 DESC_RE = re.compile(r'"desc":"(.*?)","create_time"')
+AUTHOR_RE = re.compile(r'"nickname":"(.*?)"')
+LIKES_RE = re.compile(r'"digg_count":(\d+)')
 
 
 class DouyinError(RuntimeError):
@@ -380,12 +382,9 @@ def _extract_via_feed(
             "这类视频本身不支持下载。"
         )
 
-    # 图集（图文笔记）：不是视频流
+    # 图集（图文帖）：Feed 接口只回推荐流，这里返回 None 交给分享页路径处理
     if target.get("images"):
-        raise DouyinError(
-            f"这是一条图文/图集内容（{len(target['images'])} 张图），没有视频流，"
-            "抖音图集暂不支持下载。"
-        )
+        return None
 
     video = target.get("video") or {}
     if not video:
@@ -486,16 +485,20 @@ def _extract_via_feed(
 
 
 def fetch_share_page(opener: urllib.request.OpenerDirector, numeric_id: str) -> str:
-    """请求 SSR 分享页；必须已带游客 Cookie，否则只会拿到风控壳页。"""
+    """请求 SSR 分享页；必须已带游客 Cookie，否则只会拿到风控壳页。
+
+    分享页既承载视频帖（内联 `play_addr`），也承载图文帖（内联 `images`），
+    因此有任一数据即视为成功，具体类型由调用方判断。
+    """
     url = SHARE_PAGE_TEMPLATE.format(video_id=numeric_id)
     status, body, _ = _request_with_retry(opener, url, timeout=25)
     html = body.decode("utf-8", "replace")
     if status != 200:
         raise DouyinError(f"分享页返回 HTTP {status}")
-    if "play_addr" not in html:
+    if "play_addr" not in html and '"images":[' not in html:
         if "_$jsvmprt" in html or "captcha" in html:
-            raise DouyinError("抖音分享页触发了风控（未渲染视频数据），该兜底路径暂不可用")
-        raise DouyinError("分享页未包含视频数据（可能是图文笔记、私密视频或已被删除）")
+            raise DouyinError("抖音分享页触发了风控（未渲染内容数据），请稍后重试")
+        raise DouyinError("分享页未包含内容数据（可能是私密内容或已被删除）")
     return html
 
 
@@ -525,11 +528,157 @@ def play_url_for(opener: urllib.request.OpenerDirector, video_id: str, ratio: st
     raise DouyinError("播放接口未返回直链（" + "；".join(errors[:2]) + "）")
 
 
+# ---------------------------------------------------------------- 图文（图集）
+
+
+def parse_images_array(html: str) -> list[dict[str, Any]] | None:
+    """从分享页内联数据里提取 `images` 数组。
+
+    页面里是内联 JSON，路径中的 `/` 被转义为 `\\u002F`，需还原后再解析。
+    用括号配平而非正则，避免图片多时匹配被截断。
+    """
+    start = html.find('"images":[')
+    if start < 0:
+        return None
+    begin = html.index("[", start)
+    depth = 0
+    end = None
+    for idx in range(begin, len(html)):
+        char = html[idx]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    if end is None:
+        return None
+    try:
+        parsed = json.loads(html[begin:end].replace("\\u002F", "/"))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def rank_image_urls(url_list: list[str] | None) -> list[str]:
+    """给图片候选链接排序。
+
+    实测对比同一张图的三种链接：
+      - `url_list` 的 `.jpeg`：199.8KB **无水印原图** ← 首选
+      - `url_list` 的 `.webp`：127.1KB，同源但体积更小
+      - `download_url_list`：模板名带 `-water`，**带水印**，不使用
+
+    因此只接受 `url_list`，并把 jpeg 排在 webp 之前。
+    """
+    urls = [u for u in (url_list or []) if u]
+    jpegs = [u for u in urls if ".jpeg?" in u or ".jpg?" in u]
+    others = [u for u in urls if u not in jpegs]
+    return jpegs + others
+
+
+def image_extension(url: str) -> str:
+    for ext in (".jpeg", ".jpg", ".webp", ".png", ".heic"):
+        if ext in url:
+            return ext.lstrip(".")
+    return "jpg"
+
+
+def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
+    """把分享页里的 images 数组转成归一化的图集结果。
+
+    返回 None 表示这不是图文帖（应交给视频路径处理）。
+    """
+    images = parse_images_array(html)
+    if not images:
+        return None
+
+    desc = DESC_RE.search(html)
+    title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
+    author = AUTHOR_RE.search(html)
+    likes = LIKES_RE.search(html)
+
+    items: list[dict[str, Any]] = []
+    formats: list[dict[str, Any]] = []
+    for index, image in enumerate(images, 1):
+        ranked = rank_image_urls(image.get("url_list"))
+        if not ranked:
+            continue
+        url = ranked[0]
+        width, height = image.get("width"), image.get("height")
+        # 动图（实况照片）：同一张图附带一小段视频
+        animated = (image.get("video") or {}).get("play_addr", {}).get("url_list") or []
+        ext = image_extension(url)
+        items.append({
+            "index": index,
+            "url": url,
+            "urls": ranked,
+            "ext": ext,
+            "width": width,
+            "height": height,
+            "animated_url": animated[0] if animated else None,
+        })
+        size_text = f" {width}×{height}" if width and height else ""
+        formats.append({
+            "format_id": f"douyin-image-{index}",
+            "label": f"图 {index}{size_text}" + ("（实况）" if animated else ""),
+            "ext": ext,
+            "height": height,
+            "width": width,
+            "fps": None,
+            "vcodec": None,
+            "acodec": None,
+            "abr": None,
+            "tbr": None,
+            "filesize": None,
+            "filesize_text": None,
+            "has_video": False,
+            "has_audio": False,
+            "is_audio_only": False,
+            "note": "原图（无水印）",
+            "protocol": "https",
+        })
+
+    if not items:
+        return None
+
+    return {
+        "kind": "gallery",
+        "url": f"https://www.douyin.com/note/{numeric_id}",
+        "id": numeric_id,
+        "title": title,
+        "uploader": author.group(1).strip() if author else None,
+        "extractor": "Douyin (VideoHarbor 直连)",
+        "duration": None,
+        "duration_text": None,
+        "thumbnail": items[0]["url"],
+        "description": "",
+        "view_count": None,
+        "like_count": int(likes.group(1)) if likes else None,
+        "upload_date": None,
+        "is_live": False,
+        "has_subtitles": False,
+        "subtitle_langs": [],
+        "formats": formats,
+        "presets": [],
+        "image_count": len(items),
+        # 下载所需的全部信息（tasks 会据此直接抓图，不走 yt-dlp）
+        "images": items,
+        "direct_headers": {"Referer": CDN_REFERER, "User-Agent": UA_IPHONE},
+        "note": f"抖音图文帖：共 {len(items)} 张原图（无水印），将逐张下载",
+    }
+
+
 def _extract_via_share(
     opener: urllib.request.OpenerDirector, numeric_id: str, preset: str | None
 ) -> dict[str, Any]:
-    """兜底路径：分享页取 video_id + 播放接口换直链。"""
+    """分享页路径：图文帖返回图集，视频帖取 video_id 后换直链。"""
     html = fetch_share_page(opener, numeric_id)
+
+    gallery = extract_gallery(html, numeric_id)
+    if gallery is not None:
+        return gallery
+
     video_id = extract_video_id(html)
 
     desc = DESC_RE.search(html)
@@ -595,22 +744,27 @@ def extract(
 
     numeric_id = resolve_numeric_id(opener, url)
 
-    # 主路径：App 端 Feed 接口（免签名、更稳，且带精确档位信息）
+    # 主路径：App 端 Feed 接口（免签名、更稳，且带精确档位信息）。
+    # 注意：Feed 接口对"图文帖"不返回目标数据（只回推荐流），因此这种情况
+    # 必须降级到分享页路径，而不能据此判定"视频不可用"。
     feed_error: DouyinError | None = None
+    feed_unavailable: DouyinUnavailable | None = None
     try:
         info = _extract_via_feed(opener, numeric_id, preset)
         if info is not None:
             return info
-    except DouyinUnavailable:
-        raise
+    except DouyinUnavailable as exc:
+        feed_unavailable = exc
     except DouyinError as exc:
-        feed_error = exc  # 主路径失效 → 记录后降级
+        feed_error = exc
 
-    # 兜底路径：SSR 分享页 + 播放直链接口
+    # 分享页路径：图文帖在这里解析成图集；视频帖继续取直链
     try:
         return _extract_via_share(opener, numeric_id, preset)
     except DouyinError as share_error:
-        # 两条路径都失败：把主路径的原因一并带上，便于判断是"接口变了"还是"视频不可用"
+        # 分享页也失败：若主路径已明确判定"作品不可下载"，用它更准确的原因
+        if feed_unavailable is not None:
+            raise feed_unavailable from share_error
         if feed_error:
             raise DouyinError(f"{share_error}（另一条通路：{feed_error}）") from share_error
         raise

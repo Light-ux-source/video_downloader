@@ -46,6 +46,12 @@ PHASE_TEXT = {
 # 多策略重试之间的退避基数（秒）：第 N 次重试前等待 N*基数
 RETRY_BACKOFF_SECONDS = 5.0
 
+def _safe_folder_name(raw: str) -> str:
+    """把标题变成安全的目录名（去掉路径分隔符与非法字符）。"""
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", str(raw or "")).strip(" .")
+    return (name[:80] or "douyin")
+
+
 MAX_LOG_LINES = 400
 
 # 判断失败是否来自字幕后处理（这类失败不该让视频本体一起失败）
@@ -390,6 +396,11 @@ class TaskManager:
         # 抖音：yt-dlp 撞签名墙，先换成免 Cookie 直链（见 core/douyin.py）
         self._resolve_douyin_direct(task)
 
+        # 抖音图文帖：直接抓图（图片不是流媒体，无需 yt-dlp 参与）
+        if task.options.get("_douyin_images"):
+            self._download_douyin_gallery(task, download_dir)
+            return
+
         # 多策略执行：网络抖动/编码流被拒时，逐级降级重试，显著提高成功率
         audio_only = bool(
             ytdlp.preset_by_id(str(task.options.get("preset") or "best")).get("audio_only")
@@ -578,6 +589,25 @@ class TaskManager:
             task.last_warning = f"抖音直连通路失败：{exc}"
             return
 
+        if not task.title:
+            task.title = info.get("title")
+        if not task.thumbnail:
+            task.thumbnail = info.get("thumbnail")
+
+        # 图文帖：是一组图片，交给原生下载逻辑（不走 yt-dlp）
+        if info.get("kind") == "gallery" and info.get("images"):
+            task.options = {
+                **task.options,
+                "_source_url": original,
+                "_douyin_images": info["images"],
+                "_douyin_headers": info.get("direct_headers") or {},
+            }
+            task.log.append(
+                f"# 抖音图文帖：共 {len(info['images'])} 张原图（无水印），将逐张下载"
+            )
+            self._emit(task)
+            return
+
         task.options = {
             **task.options,
             "_source_url": original,
@@ -585,13 +615,9 @@ class TaskManager:
         }
         task.url = info["direct_url"]
         task.playlist_total = None
-        if not task.title:
-            task.title = info.get("title")
-        if not task.thumbnail:
-            task.thumbnail = info.get("thumbnail")
         task.log.append(
             f"# 抖音直连通路成功：video_id={info.get('video_id')} "
-            f"档位={info.get('ratio')}（yt-dlp 提取器不可用，已改用官方播放直链接口）"
+            f"档位={info.get('ratio')}（yt-dlp 提取器不可用，已改用播放直链接口）"
         )
         self._emit(task)
 
@@ -616,6 +642,11 @@ class TaskManager:
             if not path.is_file():
                 result.append(raw)
                 continue
+            # 已经放在以标题命名的子目录里（如抖音图文帖的 图片N.jpeg）
+            # → 不要改名，否则会破坏逐张编号
+            if path.parent.name == safe:
+                result.append(raw)
+                continue
             # 文件名已经以标题开头 → 无需改名
             if path.stem.startswith(safe[:40]):
                 result.append(raw)
@@ -633,6 +664,87 @@ class TaskManager:
                 task.log.append(f"# 重命名失败（保留原文件名）：{exc}")
                 result.append(raw)
         return result
+
+    def _download_douyin_gallery(self, task: Task, download_dir: Path) -> None:
+        """下载抖音图文帖的全部原图。
+
+        图片不是流媒体，交给 yt-dlp 反而绕远：这里直接用 urllib 逐张抓取，
+        并复用统一的收尾逻辑判定结果。产物放在 `{标题}/图片N.扩展名` 子目录里，
+        便于一次图文帖的图片聚合在一起。
+        """
+        import urllib.request
+
+        from . import douyin
+
+        images: list[dict[str, Any]] = list(task.options.get("_douyin_images") or [])
+        headers = dict(task.options.get("_douyin_headers") or {})
+        total = len(images)
+        task.playlist_total = total
+        task.phase = PHASE_DOWNLOADING
+        task.message = f"开始下载 {total} 张原图"
+        self._emit(task)
+
+        folder = download_dir / _safe_folder_name(task.title or task.url)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._fail(task, f"无法创建目录：{exc}")
+            return
+
+        result_file = config.CACHE_DIR / f"result_{task.id}.txt"
+        produced: list[str] = []
+        failures: list[str] = []
+
+        for index, image in enumerate(images, 1):
+            if task.state == STATE_CANCELED:
+                return
+            urls = [u for u in ([image.get("url")] + list(image.get("urls") or [])) if u]
+            ext = image.get("ext") or "jpg"
+            target = folder / f"图片{index}.{ext}"
+            task.message = f"下载第 {index}/{total} 张原图"
+            task.percent = round((index - 1) / max(total, 1) * 100, 2)
+
+            written = False
+            for url in urls:
+                try:
+                    request = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        data = response.read()
+                    if not data:
+                        continue
+                    target.write_bytes(data)
+                    task.downloaded_bytes += len(data)
+                    produced.append(str(target))
+                    written = True
+                    break
+                except Exception as exc:  # noqa: BLE001 - 逐张容错，单张失败不影响其余
+                    task.log.append(f"# 第 {index} 张下载失败（换下一条链接）：{exc}")
+                    continue
+            if not written:
+                failures.append(f"第 {index} 张")
+                task.warnings += 1
+
+            task.item_index = index
+            task.percent = round(index / max(total, 1) * 100, 2)
+            task.updated_at = time.time()
+            self._emit(task)
+
+        # 写出产物清单，复用 _finalize 的校验与终态处理
+        try:
+            result_file.write_text("\n".join(produced) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+        if failures:
+            task.log.append(f"# {len(failures)} 张图片下载失败：{', '.join(failures[:6])}")
+            task.failed_items = len(failures)
+
+        self._finalize(
+            task, folder, result_file, time.time() - 1, set(), audio_only=False
+        )
+        if not task.incomplete and produced:
+            task.message = f"全部完成：共 {len(produced)} 张原图"
+            self._emit(task)
 
     def _spawn_engine(
         self, task: Task, task_id: str, download_dir: Path, result_file: Path

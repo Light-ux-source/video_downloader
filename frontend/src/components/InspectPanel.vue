@@ -25,6 +25,19 @@ watch(
 )
 
 const isPlaylist = computed(() => props.info?.kind === 'playlist')
+const isGallery = computed(() => props.info?.kind === 'gallery')
+
+// 图集：把 images 数组转成可展示的卡片（含逐张尺寸）
+const galleryItems = computed(() =>
+  (props.info?.images || []).map((img) => ({
+    index: img.index,
+    url: img.url,
+    ext: img.ext,
+    width: img.width,
+    height: img.height,
+    animated: Boolean(img.animated_url),
+  })),
+)
 
 const videoFormats = computed(
   () => (props.info?.formats || []).filter((f) => f.has_video && f.height).slice(0, 40),
@@ -35,7 +48,7 @@ const audioFormats = computed(() =>
 )
 
 const metaRows = computed(() => {
-  if (!props.info || isPlaylist.value) return []
+  if (!props.info || isPlaylist.value || isGallery.value) return []
   return [
     { label: '站点', value: props.info.extractor || '—' },
     { label: '时长', value: props.info.duration_text || formatDuration(props.info.duration) },
@@ -109,6 +122,49 @@ function downloadSelected() {
           <Icon name="retry" :size="13" />
           重试
         </button>
+      </div>
+
+      <!-- 图文帖（图集） -->
+      <div v-else-if="isGallery" class="gallery">
+        <header class="gallery__head">
+          <div>
+            <h3 class="video__title">{{ info.title }}</h3>
+            <p class="gallery__meta">
+              <Icon name="layers" :size="12" />
+              图文帖 · 共 <strong class="mono-num">{{ info.image_count }}</strong> 张原图（无水印）
+              <template v-if="info.uploader"> · {{ info.uploader }}</template>
+            </p>
+          </div>
+          <button
+            class="btn btn--primary"
+            :disabled="submitting"
+            @click="emit('download', { preset: 'best' })"
+          >
+            <Icon name="download" :size="15" />
+            下载全部 {{ info.image_count }} 张
+          </button>
+        </header>
+
+        <p class="gallery__hint">
+          <Icon name="info" :size="12" />
+          图片将保存到 <code>{{ info.title }}/</code> 目录，命名为
+          <code>图片1.{{ galleryItems[0]?.ext || 'jpeg' }}</code> 依次排列。
+        </p>
+
+        <ul class="gallery__grid">
+          <li v-for="item in galleryItems" :key="item.index" class="gallery__cell">
+            <img
+              :src="item.url"
+              :alt="`第 ${item.index} 张图`"
+              loading="lazy"
+              referrerpolicy="no-referrer"
+            />
+            <span class="gallery__badge mono-num">
+              {{ item.index }} · {{ item.width }}×{{ item.height }}
+              <template v-if="item.animated"> · 实况</template>
+            </span>
+          </li>
+        </ul>
       </div>
 
       <!-- 播放列表 -->
@@ -569,6 +625,84 @@ a.playlist__name:hover {
 .fold-leave-to {
   opacity: 0;
   transform: translateY(-6px);
+}
+
+.gallery__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.gallery__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--neon);
+}
+
+.gallery__hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 var(--sp-3);
+  font-size: 11.5px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+
+.gallery__hint code {
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.4);
+  color: var(--text-dim);
+}
+
+.gallery__grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: var(--sp-2);
+}
+
+.gallery__cell {
+  position: relative;
+  aspect-ratio: 3 / 4;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #05060a;
+}
+
+.gallery__cell img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform var(--dur-slow) var(--ease);
+}
+
+.gallery__cell:hover img {
+  transform: scale(1.04);
+}
+
+.gallery__badge {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.78);
+  border: 1px solid var(--border-strong);
+  font-size: 10.5px;
+  color: var(--text-dim);
 }
 
 @media (max-width: 768px) {

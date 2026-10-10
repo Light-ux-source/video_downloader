@@ -4,6 +4,59 @@
 
 ---
 
+## 阶段 7：抖音图文帖（图集）支持
+
+**背景**：用户反馈"只有图文类解析不成功，其他形式都能无水印下载"，并提供了一条真实图文帖链接。
+
+### 调研过程
+
+先穷举免签名路径，确认**图文帖数据在哪里**：
+
+| 尝试 | 结果 |
+|---|---|
+| App Feed 接口 | ❌ 对图文帖只返回推荐流，不含目标数据 |
+| App detail 接口 | ❌ HTTP 200 但空响应 |
+| Web detail 接口（自注册游客 ttwid） | ❌ 403 `Blocked by ArgusSecurityPlugin Uifid Not Found` |
+| **SSR 分享页 `/share/video/<id>/`** | ✅ **`images` 数组内联在页面里** |
+
+同时对比了两个开源实现：
+
+- [YusongXiao/douyin_phaser](https://github.com/YusongXiao/douyin_phaser)：用真实 Chrome + DOM 抽取
+- [belingud/douyin-downloader-skill](https://github.com/belingud/douyin-downloader-skill)：
+  自实现 `a_bogus` 签名（434+120 行，Apache-2.0）调 Web detail 接口
+
+**最终选择分享页方案**：已实测可用，且**不需要引入签名代码**、不需要浏览器自动化。
+
+### 关键实测结论
+
+| 项 | 结论 |
+|---|---|
+| 原图在哪 | `images[].url_list` 的 **`.jpeg`**：199.8KB、1000×1573、**无水印** |
+| 哪个不能用 | `download_url_list` 模板名带 `-water`：129.4KB webp、**带水印**，已排除 |
+| 存放方式 | `downloads/{标题}/图片1.jpeg`、`图片2.jpeg`… |
+
+### 交付
+
+- `core/douyin.py`：新增 `parse_images_array()`（括号配平解析内联 JSON）、
+  `rank_image_urls()`（jpeg 原图优先）、`extract_gallery()`
+- `core/tasks.py`：新增 `_download_douyin_gallery()` 原生逐张下载（图片不是流媒体，
+  不走 yt-dlp），并复用统一的收尾校验
+- `frontend/InspectPanel.vue`：新增图集展示（图片网格 + 逐张尺寸 + 「下载全部 N 张」）
+- **修了一个连带 bug**：收尾时的"按标题重命名"会把图集的 `图片1.jpeg` 改成 `标题.jpeg`，
+  破坏逐张编号；现在检测到文件已在以标题命名的子目录里就跳过重命名
+
+### 实测
+
+| 场景 | 结果 |
+|---|---|
+| 图集解析（用户提供的链接） | ✅ 3.6s，识别为 `kind=gallery`，1 张 1000×1573 原图 |
+| 图集下载 | ✅ `downloads/#厦门/图片1.jpeg`，199.8KB，无水印 |
+| 抖音视频（回归） | ✅ 仍正常，1080p |
+| B 站 / YouTube（回归） | ✅ 15 / 80 个画质 |
+| 自测 | ✅ 159 → **177 项**全部通过 |
+
+---
+
 ## 阶段 6：抖音通路升级（App Feed 接口）+ 不可下载场景的精确提示
 
 **背景**：用户反馈"视频不支持下载时解析不成功"，需要继续找方案。

@@ -8,6 +8,8 @@
 
 ![任务队列](docs/screenshot-queue.png)
 
+> 图文帖（图集）解析与下载：[docs/screenshot-gallery.png](docs/screenshot-gallery.png)
+
 ---
 
 ## 30 秒上手
@@ -39,7 +41,8 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 | **播放列表** | 整列表下载或指定条目（`1-5,8`）；显示条目进度，部分失败明确标注 |
 | **字幕** | 下载并内嵌字幕（可选自动生成字幕、指定语言） |
 | **高级参数** | Cookies 文件 / 从浏览器读 Cookies / 代理 / 限速 / 并发分片 / 自定义格式表达式 |
-| **抖音免 Cookie** | 内置专用通道：**无需登录、无需提供 Cookie**，直接拿到**无水印**原画（最高 1080p） |
+| **抖音免 Cookie** | 内置专用通道：**无需登录、无需提供 Cookie**，视频拿**无水印**原画（最高 1080p） |
+| **抖音图文帖** | 图集逐张下载**无水印原图**，保存到 `标题/图片N.jpeg`；自动识别实况（动图） |
 
 ### 自动容错
 
