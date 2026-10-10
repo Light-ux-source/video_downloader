@@ -81,6 +81,22 @@
   - `_finalize()`：产物定位 + 部分失败判定（单独抽出以便单元测试）
   - 历史裁剪：超出上限时清理已结束任务
 
+### `core/douyin.py` — 抖音免 Cookie 直连通道
+
+yt-dlp 的抖音提取器撞签名墙（`encrypt_data_miss` / 403），因此单独实现一条通路：
+
+```
+首页拿游客 Cookie（ttwid）→ SSR 分享页取 video_id → App 端旧播放接口换 CDN 直链 → 带 Referer 下载
+```
+
+- 不依赖用户登录态与 Cookie，也不需要实现 `a_bogus` 签名
+- 只用 `/aweme/v1/play/`（无水印原画）；`playwm` 固定 720p 且带水印，仅作兜底
+- 档位映射：`best/1080→1080p`、`720→720p`、`480/360→540p`
+- 失败抛 `DouyinError`，消息可直接展示；调用方（probe / tasks）会把真实原因写进日志，
+  避免被 yt-dlp 上游的模糊报错误导
+
+详见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#抖音已支持免-cookie-直连通道)。
+
 ### `core/server.py` — HTTP 层
 - 路由表、JSON 读写、请求体大小限制
 - SSE 端点（订阅 → 推送 → 终态关闭 + 心跳）
@@ -145,7 +161,7 @@ POST /api/tasks
 | 想做什么 | 改哪里 |
 |---|---|
 | 增加画质预设 | `core/ytdlp.py` 的 `QUALITY_PRESETS` + 前端自动读取 `/api/presets` |
-| 支持新站点 | 通常无需改代码（yt-dlp 负责）；若需特殊 URL 纠正，加进 `normalize_url()` |
+| 支持新站点 | 通常无需改代码（yt-dlp 负责）；若需特殊 URL 纠正，加进 `normalize_url()`；若引擎撞签名墙，参考 `core/douyin.py` 的独立通道写法 |
 | 增加下载参数 | `build_format_args()` 加参数 + `core/server.py` 的 `_download_options` 白名单 + 前端表单 |
 | 调整重试策略 | `core/ytdlp.py` 的 `STRATEGY_PATCHES` |
 | 换成 FastAPI/Flask | 只需替换 `core/server.py`，其余模块不依赖 HTTP 框架 |

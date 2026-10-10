@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from . import config
+from . import config, douyin
 
 # ---------------------------------------------------------------------------
 # 进度解析
@@ -306,6 +306,9 @@ def build_format_args(opts: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
 
     if normalized["proxy"]:
         args += ["--proxy", sanitize_proxy(normalized["proxy"]) or normalized["proxy"]]
+    # 自定义请求头（抖音 CDN 需要 Referer，否则 403）
+    for key, value in (opts.get("headers") or {}).items():
+        args += ["--add-header", f"{key}:{value}"]
     if normalized["limit_rate"]:
         args += ["--limit-rate", normalized["limit_rate"]]
     if normalized["concurrent_fragments"] > 1:
@@ -688,6 +691,18 @@ def probe(url: str, opts: dict[str, Any] | None = None, timeout: int | None = No
     opts = opts or {}
     # 已知不受支持的链接形态先纠正（例如抖音 /note/ → /video/）
     target_url, url_note = normalize_url(url)
+
+    # 抖音：yt-dlp 的提取器撞签名墙（encrypt_data_miss / 403），
+    # 改走专用免 Cookie 直连通路（见 core/douyin.py 的说明）。
+    if douyin.is_douyin_url(target_url):
+        info = douyin.extract(
+            target_url,
+            preset=opts.get("preset"),
+            proxy=sanitize_proxy(str(opts["proxy"])) if opts.get("proxy") else None,
+        )
+        if url_note:
+            info["note"] = f"{url_note}；{info.get('note', '')}".strip("；")
+        return info
     args = [
         *_base_args(),
         "--dump-single-json",

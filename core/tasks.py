@@ -387,6 +387,9 @@ class TaskManager:
         before_files = ytdlp.snapshot_dir(download_dir)
         started = time.time()
 
+        # 抖音：yt-dlp 撞签名墙，先换成免 Cookie 直链（见 core/douyin.py）
+        self._resolve_douyin_direct(task)
+
         # 多策略执行：网络抖动/编码流被拒时，逐级降级重试，显著提高成功率
         audio_only = bool(
             ytdlp.preset_by_id(str(task.options.get("preset") or "best")).get("audio_only")
@@ -518,6 +521,11 @@ class TaskManager:
             bool(expected) and complete_count < expected
         )
 
+        # CDN 直链（抖音等）下载下来是乱码文件名，按任务标题重命名
+        renamed = self._rename_to_title(task, produced, download_dir)
+        if renamed:
+            produced = renamed
+
         if produced:
             path = Path(produced[0])
             task.filepath = str(path)
@@ -545,6 +553,86 @@ class TaskManager:
         task.finished_at = time.time()
         task.updated_at = task.finished_at
         self._emit(task)
+
+    def _resolve_douyin_direct(self, task: Task) -> None:
+        """把抖音链接换成免 Cookie 的 CDN 直链。
+
+        yt-dlp 的抖音提取器会撞签名墙（encrypt_data_miss / 403），
+        因此这里改用直连通路；失败时保留原链接，让 yt-dlp 按常规流程报错。
+        """
+        from . import douyin
+
+        original = task.options.get("_source_url") or task.url
+        if not douyin.is_douyin_url(original):
+            return
+        try:
+            info = douyin.extract(
+                original,
+                preset=str(task.options.get("preset") or "best"),
+                proxy=ytdlp.sanitize_proxy(task.options.get("proxy")) if task.options.get("proxy") else None,
+            )
+        except douyin.DouyinError as exc:
+            # 保留原链接继续走 yt-dlp（它大概率会报 needs cookies），
+            # 但把真实原因写进日志，避免用户被上游的模糊报错误导。
+            task.log.append(f"# 抖音直连通路失败：{exc}")
+            task.last_warning = f"抖音直连通路失败：{exc}"
+            return
+
+        task.options = {
+            **task.options,
+            "_source_url": original,
+            "headers": info.get("direct_headers") or {},
+        }
+        task.url = info["direct_url"]
+        task.playlist_total = None
+        if not task.title:
+            task.title = info.get("title")
+        if not task.thumbnail:
+            task.thumbnail = info.get("thumbnail")
+        task.log.append(
+            f"# 抖音直连通路成功：video_id={info.get('video_id')} "
+            f"档位={info.get('ratio')}（yt-dlp 提取器不可用，已改用官方播放直链接口）"
+        )
+        self._emit(task)
+
+    @staticmethod
+    def _rename_to_title(task: Task, produced: list[str], download_dir: Path) -> list[str]:
+        """把乱码文件名（CDN 直链的无意义 basename）改成任务标题。
+
+        仅在标题已知、且当前文件名确实"不像标题"时执行；
+        重名时自动追加序号，避免覆盖已有文件。
+        """
+        title = (task.title or "").strip()
+        if not title or not produced:
+            return produced
+
+        safe = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", title).strip(" .")[:120]
+        if not safe:
+            return produced
+
+        result: list[str] = []
+        for raw in produced:
+            path = Path(raw)
+            if not path.is_file():
+                result.append(raw)
+                continue
+            # 文件名已经以标题开头 → 无需改名
+            if path.stem.startswith(safe[:40]):
+                result.append(raw)
+                continue
+            candidate = download_dir / f"{safe}{path.suffix}"
+            index = 2
+            while candidate.exists() and candidate != path:
+                candidate = download_dir / f"{safe} ({index}){path.suffix}"
+                index += 1
+            try:
+                path.rename(candidate)
+                task.log.append(f"# 已按标题重命名：{path.name[:40]} → {candidate.name[:40]}")
+                result.append(str(candidate))
+            except OSError as exc:
+                task.log.append(f"# 重命名失败（保留原文件名）：{exc}")
+                result.append(raw)
+        return result
 
     def _spawn_engine(
         self, task: Task, task_id: str, download_dir: Path, result_file: Path

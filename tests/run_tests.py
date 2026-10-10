@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import config, server, ytdlp  # noqa: E402
+from core import config, douyin, server, ytdlp  # noqa: E402
 from core.tasks import (  # noqa: E402
     STATE_CANCELED,
     STATE_DONE,
@@ -249,6 +249,71 @@ def test_environment_adaptation() -> None:
         check(f"提示可操作：{raw[:32]}", expect in text, f"→ {text[-60:]}")
     check("未知错误原样返回", ytdlp.friendly_error("莫名其妙的错误") == "莫名其妙的错误")
     check("空错误有兜底文案", "解析失败" in ytdlp.friendly_error(""))
+
+
+def test_douyin(tmp: Path) -> None:
+    """抖音免 Cookie 通道：URL 识别、档位映射、id 提取、文件名重命名。"""
+    section("抖音链接识别")
+    for url in (
+        "https://www.douyin.com/video/7694879952763751680",
+        "https://www.douyin.com/note/7694879952763751680",
+        "https://v.douyin.com/aAQgycBvBp0/",
+        "https://www.iesdouyin.com/share/video/7694879952763751680/",
+    ):
+        check(f"识别为抖音：{url[:46]}", douyin.is_douyin_url(url))
+    for url in (
+        "https://www.bilibili.com/video/BV1GJ411x7h7",
+        "https://www.youtube.com/watch?v=abc",
+        "https://douyin.com.evil.com/video/1",
+    ):
+        check(f"不误判：{url[:46]}", not douyin.is_douyin_url(url))
+
+    section("抖音画质档位映射")
+    # 实测：play 接口才真正响应 ratio；playwm 固定 720p 且带水印
+    check("best → 1080p", douyin.ratio_for_preset("best") == "1080p")
+    check("720 → 720p", douyin.ratio_for_preset("720") == "720p")
+    check("480/360 → 540p（最低档）", douyin.ratio_for_preset("480") == "540p"
+          and douyin.ratio_for_preset("360") == "540p")
+    check("未知预设回退 1080p", douyin.ratio_for_preset("nonsense") == "1080p")
+
+    section("抖音页面数据提取")
+    html = ('...{"video":{"play_addr":{"uri":"v0d00fg10000db4r7cfog65jtejrikfg",'
+            '"url_list":["https:\\u002F\\u002Faweme.snssdk.com\\u002F"]},'
+            '"duration":122440},"desc":"测试标题 #话题","create_time":1791603860}')
+    check("提取 video_id", douyin.extract_video_id(html) == "v0d00fg10000db4r7cfog65jtejrikfg")
+    check("提取标题", douyin.DESC_RE.search(html).group(1) == "测试标题 #话题")
+    try:
+        douyin.extract_video_id('{"data":{}}')
+        check("缺少 play_addr 时报错", False)
+    except douyin.DouyinError:
+        check("缺少 play_addr 时报错", True)
+
+    section("抖音文件名规范化")
+    manager = TaskManager(concurrency=1)
+    work = tmp / "dyrename"
+    work.mkdir(parents=True, exist_ok=True)
+    messy = work / "oMzOINEDa1fAynoQtqbJAofEPjF209Ay9xBwAg.mp4"
+    messy.write_bytes(b"x" * 20000)
+    task = manager.create("https://example.com/x", {"preset": "720", "download_dir": str(work)})
+    task.title = "韩立燃烧精血，疯狂跑路！！！"
+    renamed = TaskManager._rename_to_title(task, [str(messy)], work)
+    check("乱码文件名被改成标题", Path(renamed[0]).name.startswith("韩立燃烧精血"), f"→ {renamed[0]}")
+    check("原文件已消失", not messy.exists())
+    # 标题里含非法字符时会被替换
+    weird = work / "abc123.mp4"
+    weird.write_bytes(b"y" * 20000)
+    task.title = 'a/b:c*d?e"f<g>h|i'
+    out = TaskManager._rename_to_title(task, [str(weird)], work)
+    check("非法字符被替换为下划线", "/" not in Path(out[0]).name and ":" not in Path(out[0]).name,
+          f"→ {Path(out[0]).name}")
+    # 重名时自动加序号
+    dup = work / "zzz999.mp4"
+    dup.write_bytes(b"z" * 20000)
+    task.title = "重名测试"
+    (work / "重名测试.mp4").write_bytes(b"w" * 20000)
+    out2 = TaskManager._rename_to_title(task, [str(dup)], work)
+    check("重名自动追加序号", "(2)" in Path(out2[0]).name, f"→ {Path(out2[0]).name}")
+    manager.shutdown()
 
 
 def test_error_extraction() -> None:
@@ -608,6 +673,7 @@ def main() -> int:
         test_retry_strategies()
         test_environment_adaptation()
         test_error_extraction()
+        test_douyin(tmp)
         test_task_state_machine(tmp / "tasks")
 
     test_http_api()

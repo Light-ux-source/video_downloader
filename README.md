@@ -39,6 +39,7 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 | **播放列表** | 整列表下载或指定条目（`1-5,8`）；显示条目进度，部分失败明确标注 |
 | **字幕** | 下载并内嵌字幕（可选自动生成字幕、指定语言） |
 | **高级参数** | Cookies 文件 / 从浏览器读 Cookies / 代理 / 限速 / 并发分片 / 自定义格式表达式 |
+| **抖音免 Cookie** | 内置专用通道：**无需登录、无需提供 Cookie**，直接拿到**无水印**原画（最高 1080p） |
 
 ### 自动容错
 
@@ -98,8 +99,7 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 
 - 后端自测：**126 项全部通过**（`./run.sh --py tests/run_tests.py`）
 - 真实站点验证：B 站（视频/音频/播放列表）、YouTube（1080p 全画质）均实测通过
-- 已知不可用：**抖音**（yt-dlp 上游未实现签名算法，见
-  [排障文档](docs/TROUBLESHOOTING.md#抖音不可用原因)）
+- 抖音：✅ 已有专用免 Cookie 通道（yt-dlp 自身仍不支持，我们绕过了签名墙）
 
 ---
 

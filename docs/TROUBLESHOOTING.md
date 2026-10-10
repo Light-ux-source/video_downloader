@@ -15,69 +15,74 @@
 | YouTube | ✅ 可用 | **需要 node**（JS 挑战）+ 代理；部分视频需要 Cookies |
 | Bilibili | ✅ 可用 | 1080P 高码率需会员 Cookies；弹幕是私有 XML 格式，无法内嵌 |
 | 微博 / 小红书 / 部分国内站 | ⚠️ 视情况 | 通常需要 Cookies |
-| 抖音 | ❌ 当前不可用 | 见下节 |
+| 抖音 | ✅ 可用（免 Cookie） | 内置专用通道，无水印原画；见下节 |
 
-### 抖音不可用原因
+### 抖音：已支持（免 Cookie 直连通道）
 
-**现象**：报 `Fresh cookies are needed`，即使已经配置了完整 cookies。
+**状态**：✅ 可用。yt-dlp 自身仍然不支持抖音（撞签名墙），本项目内置了专用通道绕开它。
 
-**原因**（两条，都在 yt-dlp 侧）：
+#### 为什么 yt-dlp 不行
 
-1. **`/note/` 链接形态不被支持**。yt-dlp 的抖音提取器只写了 `/video/` 的正则：
-   ```python
-   _VALID_URL = r'https?://(?:www\.)?douyin\.com/video/(?P<id>[0-9]+)'
-   ```
-   `/note/` 会落到通用提取器，报 `Unsupported URL`。
-   程序已自动把 `/note/<id>` 改写为 `/video/<id>` 再试。
-
-2. **`/video/` 形态受签名限制**。yt-dlp 源码中明确留着未实现的 TODO：
-   ```python
-   detail = traverse_obj(self._download_json('…/aweme/detail/', …), ('aweme_detail', {dict}))
-   if not detail:
-       # TODO: Run verification challenge code to generate signature cookies
-       raise ExtractorError('Fresh cookies (not necessarily logged in) are needed', …)
-   ```
-   抖音要求 `a_bogus` / `msToken` 等请求签名，引擎尚未实现，因此接口返回空。
-
-**补充**：`v.douyin.com` 短链引擎同样不支持（源码中未出现该正则）。
-
-**结论**：这是 yt-dlp 上游缺口，不是本项目配置问题，也不是 cookies 能解决的。
-程序会给出明确提示而不是含糊报错。要根治需要换用别的签名实现（工作量属另一个量级）。
-
-#### 深挖记录（2026-10 实测，供后续参考）
-
-为了确认"是否只是配置问题"，对抖音做了穷举式探测，结论是**接口层已全面要求签名**：
+yt-dlp 的抖音提取器走 `www.douyin.com/aweme/v1/web/aweme/detail/` 这类 Web 业务接口，
+而这些接口现在要求 `a_bogus` / `msToken` 请求签名。实测结果：
 
 | 尝试 | 结果 |
 |---|---|
-| `www.douyin.com/aweme/v1/web/aweme/detail/`（新版接口，带完整 web 参数 + 代理 + cookies） | **HTTP 403 Forbidden** |
-| 同上（不带额外参数） | HTTP 403 |
-| `www.iesdouyin.com/aweme/v1/web/aweme/detail/`（移动端语义 + iPhone UA） | HTTP 403 |
-| `www.douyin.com/web/api/v2/aweme/iteminfo/`（旧版接口） | HTTP 200 但返回<br>`{"status_code": 11110, "status_msg": "encrypt_data_miss"}` |
-| `www.iesdouyin.com/web/api/v2/aweme/iteminfo/`（旧版接口 + 移动端请求头） | HTTP 200，**响应体为空** |
-| `www.douyin.com/share/video/<id>/`（桌面分享页） | HTTP 200，返回**反爬 JS-VM**（`_$jsvmprt`），无任何 JSON 数据 |
-| `www.iesdouyin.com/share/video/<id>/`（移动端分享页） | 同上 |
-| `v.douyin.com` 短链 | yt-dlp 提取器正则中不存在 |
+| Web detail 接口（带完整参数 + 代理 + cookies） | HTTP 403 |
+| 移动端 detail 接口 | HTTP 403 |
+| 旧版 `iteminfo` 接口 | 200 但返回 `{"status_code": 11110, "status_msg": "encrypt_data_miss"}`（缺加密参数） |
+| 分享页（无游客 Cookie） | 风控壳页（captcha/slardar），无数据 |
+| 页面直连 | 返回反爬 JS-VM（`_$jsvmprt`） |
 
-`status_msg: "encrypt_data_miss"`（缺少加密数据）是决定性证据——
-抖音要求请求携带 `a_bogus` / `X-Bogus` / `msToken` 等**签名参数**，
-这些参数由页面上的 JS-VM 动态生成，无法用固定值或 cookies 伪造。
+`encrypt_data_miss` 是决定性证据：请求必须携带签名，而签名由页面 JS-VM 动态生成。
+yt-dlp 源码里那行 `# TODO: Run verification challenge code to generate signature cookies`
+至今仍在，因此升级引擎也不会好。
 
-另外确认：PyPI 上 `yt-dlp` 已是当日最新（2026.8.19），
-其抖音提取器源码中 `# TODO: Run verification challenge code to generate signature cookies`
-**依然存在**，即上游尚未实现。因此"升级引擎"也不能解决。
+#### 本项目采用的通路（无需登录、无需用户 Cookie）
 
-**其它路线也验证过**：
+```
+① 访问 douyin.com / iesdouyin.com 首页
+   → 拿到游客 Cookie（ttwid、__ac_nonce）      ← 只是设备标识，不是登录态
+② 带游客 Cookie 请求 SSR 分享页 /share/video/<数字id>/
+   → 页面内联渲染出 play_addr.uri（即 video_id，形如 v0d00fg10000...）
+③ 调 App 端旧播放直链接口
+   aweme.snssdk.com/aweme/v1/play/?video_id=<id>&ratio=<档位>
+   → 302 指向 CDN 直链（该接口不需要任何签名）
+④ 带 Referer: https://www.douyin.com/ 下载 CDN
+```
 
-| 路线 | 结果 |
+关键点：
+
+- **必须带游客 Cookie 请求分享页**：不带只会拿到风控壳页——这是最容易踩的坑。
+  游客 Cookie 只要访问首页就能白拿，**用户完全无感，不需要提供任何 Cookie**。
+- **必须用 `/aweme/v1/play/`，不要用 `/aweme/v1/playwm/`**：
+  实测对比同一视频同一时间点画面：
+
+  | 接口 | 分辨率 | 水印 |
+  |---|---|---|
+  | `play` | **1920×1080** | **无水印** |
+  | `playwm` | 1280×720（固定，ratio 参数无效） | 左上角带「抖音 + 抖音号 + 昵称」水印 |
+
+  因此 `play` 是首选，`playwm` 仅作兜底。
+- 档位映射：`best/1080 → 1080p`、`720 → 720p`、`480/360 → 540p`（接口最低档）。
+- CDN 直链有效期约 1–2 小时，因此解析与下载在同一流程内完成，不会存链接过夜。
+
+#### 已知边界
+
+| 情况 | 表现 |
 |---|---|
-| 第三方解析服务（tikwm、douyin.wtf 等） | 本网络下请求被重置（`SSL: UNEXPECTED_EOF`），且需要引入外部依赖、隐私与稳定性风险 |
-| 无头 Chrome 渲染页面 | 反爬会检测自动化，`--dump-dom` 超时（90s 未返回） |
-| 抖音开放平台官方 API | 需要报备开发者资质，非个人工具可用路径 |
+| 公开视频 | ✅ 可下 |
+| 私密 / 仅好友可见 | ❌ 分享页不渲染数据 |
+| 已删除 / 地区限制 | ❌ 拿不到数据 |
+| 图文笔记（非视频） | ❌ 不是视频流 |
+| 直播 / 回放 | ❌ 走 live 接口，不适用 |
+| 抖音调整页面结构或下掉旧播放接口 | ❌ 通路失效，会给出明确报错 |
 
-**因此目前的定位是**：抖音属于"引擎上游未支持 + 站点强反爬"的双重限制，
-在不实现签名算法（或引入浏览器自动化/第三方服务）的前提下无解。
-程序的做法是**给出明确可读的提示**，而不是静默失败或让用户误以为是配置问题。
+#### 实现位置与自测
+
+- 代码：`core/douyin.py`
+- 接入点：`core/ytdlp.py::probe()`（解析）、`core/tasks.py::_resolve_douyin_direct()`（下载）
+- 自测：`tests/run_tests.py::test_douyin`（URL 识别、档位映射、数据提取、文件名规范化）
 
 ---
 

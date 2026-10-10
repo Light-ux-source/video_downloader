@@ -4,6 +4,68 @@
 
 ---
 
+## 阶段 5：抖音免 Cookie 支持（重难点攻坚）
+
+**背景**：用户实测抖音报 `Fresh cookies are needed`，且明确要求"必须实现、且不需要用户提供 Cookie"。
+
+### 定位：确认 yt-dlp 侧无解
+
+穷举抖音所有接口（详见 [TROUBLESHOOTING](TROUBLESHOOTING.md#抖音已支持免-cookie-直连通道)）：
+
+- Web/移动端 detail 接口 → **403**
+- 旧版 iteminfo 接口 → `{"status_code": 11110, "status_msg": "encrypt_data_miss"}`
+- 分享页无游客 Cookie → 风控壳页；页面直连 → 反爬 JS-VM
+- 确认 PyPI 最新版 yt-dlp 的抖音提取器仍是未实现的 TODO
+
+结论：抖音要求 `a_bogus`/msToken 签名，签名由页面 JS-VM 动态生成，**yt-dlp 与"升级引擎"都无解**。
+
+### 方案：从开源社区找到突破口并落地
+
+参考社区实践（[`douyin-nocookie-approach`](https://github.com/cat-xierluo/legal-skills/blob/main/skills/universal-media-downloader/references/douyin-nocookie-approach.md)）
+给出的关键线索——**App 端旧播放直链接口不受签名墙保护**——实测验证并补齐了缺失环节：
+
+```
+① 访问首页拿游客 Cookie（ttwid/__ac_nonce，只是设备标识，非登录态）
+② 带游客 Cookie 请求 SSR 分享页 → 提取 play_addr.uri 作为 video_id
+③ aweme.snssdk.com/aweme/v1/play/?video_id=<id>&ratio=<档位> → 302 到 CDN 直链
+④ 带 Referer 下载
+```
+
+**关键发现（社区文档未覆盖的部分）**：
+
+1. **分享页必须带游客 Cookie**，否则只返回风控壳页——社区文档记录该页已失效（2026-08-30），
+   实测发现加上游客 Cookie 后数据照常渲染，通路重新可用。
+2. **必须用 `play`，不能用 `playwm`**：通过抓取同一时间点画面做像素对比确认——
+
+   | 接口 | 分辨率 | 水印 |
+   |---|---|---|
+   | `play` | 1920×1080 | **无水印** |
+   | `playwm` | 1280×720（固定，ratio 无效） | 左上角带抖音号与昵称水印 |
+
+### 交付
+
+- 新增 `core/douyin.py`（约 300 行，含详细注释说明通路原理与边界）
+- 接入 `probe()`（解析结果直接给前端）与 `_resolve_douyin_direct()`（下载时换直链 + 带 Referer）
+- 对 CDN 直链乱码文件名做**按标题重命名**（通用能力，不只抖音受益）
+- 新增 23 项单元测试；自测从 126 项增至 **144 项**
+
+### 实测结果
+
+| 场景 | 结果 |
+|---|---|
+| 解析（你的链接） | ✅ 2.2 秒，无 Cookie，标题/video_id/档位齐全 |
+| 1080p 下载 | ✅ 49.29MB，1920×1080 h264+aac，**无水印** |
+| 720p 下载 | ✅ 35.42MB，1280×720，无水印，文件名 = 视频标题 |
+| MP3 提取 | ✅ 3.21MB，自动嵌入封面 |
+
+### 风险提示
+
+该通路依赖抖音"新旧 API 并存"的窗口期（旧播放接口为兼容老客户端而未加签名）。
+若抖音下掉该接口或给分享页也加签名，通路会失效——届时程序会给出明确报错，
+而不是含糊的上游提示。
+
+---
+
 ## 阶段 4：仓库化与文档沉淀
 
 **目标**：初始化 git 仓库、统一权限、把散落的知识沉淀成文档。
