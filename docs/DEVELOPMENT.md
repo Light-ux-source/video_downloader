@@ -3,7 +3,7 @@
 ## 1. 快速开始
 
 ```bash
-git clone <仓库地址> video_downloader && cd video_downloader
+git clone https://github.com/Light-ux-source/video_downloader.git video_downloader && cd video_downloader
 ./setup.sh                 # 准备运行时 + yt-dlp
 ./run.sh                   # 启动（后端 + 已构建的前端产物）
 ```

@@ -215,7 +215,40 @@ lsof -nP -iTCP:7897 -sTCP:LISTEN                           # 是哪个客户端�
 **典型症状**：端口开放、客户端在监听，但所有请求 0.3 秒即失败
 （`curl` 退出码 35）。这是代理**上游节点**的问题，与本项目无关。
 
-### 6. 运行自测
+### 6. git 推送/克隆 github.com 失败
+
+**症状**：`git push` 报
+`Failed to connect to ghproxy.com port 443 after 75000 ms`。
+
+**原因**：本机全局 git 配置把 github.com 请求改写成第三方镜像：
+
+```bash
+git config --global --get-regexp 'url\..*insteadof'
+# url.https://ghproxy.com/https://github.com/.insteadof https://github.com/
+```
+
+当该镜像失效时，所有 GitHub 操作都会被改写到一个连不上的地址。
+
+**临时绕过（不改配置）**：
+
+```bash
+GIT_CONFIG_GLOBAL=/dev/null git \
+  -c http.proxy=http://127.0.0.1:7897 \
+  -c https.proxy=http://127.0.0.1:7897 push
+```
+
+**永久修复**（自行决定）：
+
+```bash
+git config --global --unset url.https://ghproxy.com/https://github.com/.insteadof
+# 若需要走代理访问 GitHub，再配置（代理不稳定时也可不配，直连实测可用）：
+git config --global http.proxy http://127.0.0.1:7897
+```
+
+> 注意：`git -c url.<base>.insteadof=` 无法清空已有的多值配置，
+> 因此必须用 `--unset` 删除，或用 `GIT_CONFIG_GLOBAL=/dev/null` 一次性屏蔽。
+
+### 7. 运行自测
 
 ```bash
 ./run.sh --py tests/run_tests.py          # 离线，126 项

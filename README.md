@@ -1,5 +1,7 @@
 # VideoHarbor · 视频下载神器
 
+> 仓库：https://github.com/Light-ux-source/video_downloader
+>
 > 一个**本地运行**的视频下载工作台：粘贴链接 → 选画质 → 实时看着它下完。
 > 站点适配交给 [yt-dlp](https://github.com/yt-dlp/yt-dlp)（覆盖 1800+ 站点），
 > 我们只负责把「解析、选流、下载、合流、进度、容错」编排得顺手。
@@ -11,7 +13,7 @@
 ## 30 秒上手
 
 ```bash
-git clone <仓库地址> video_downloader && cd video_downloader
+git clone https://github.com/Light-ux-source/video_downloader.git video_downloader && cd video_downloader
 
 ./setup.sh     # 一次性：准备自带 Python 运行时 + yt-dlp（约 1 分钟，无需 sudo）
 ./run.sh       # 启动服务
