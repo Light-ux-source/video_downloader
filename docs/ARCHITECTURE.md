@@ -102,9 +102,12 @@ yt-dlp 的抖音提取器撞签名墙（`encrypt_data_miss` / 403），因此单
 - 档位映射：`best/1080→1080p`、`720→720p`、`480/360→540p`；低于最低档时取最小档
 - 主路径的 `bit_rate` 通常最高 720p，请求更高画质时会用播放接口补一条 1080p 直链
 - **图文帖（图集）**：Feed 接口不返回目标数据，改由分享页的 `images` 数组解析；
-  优选 `url_list` 的 `.jpeg` 原图（实测无水印），排除带 `-water` 模板的 `download_url_list`；
-  下载不走 yt-dlp（图片不是流媒体），由 `tasks._download_douyin_gallery()` 原生逐张抓取，
-  产物落在 `downloads/{标题}/图片N.ext`
+  优选 `url_list` 的 `.jpeg` 原图（实测无水印），排除带 `-water` 模板的 `download_url_list`
+- **图文帖输出为视频**：这类帖子没有视频流（帖子级 video 只有封面、`bit_rate` 为空），
+  但客户端播放的是「图片轮播 + 配乐」，因此由 `tasks._download_douyin_gallery()` 下载素材后，
+  用 `compose_slideshow_video()` 本地合成 `{标题}.mp4`（竖屏 1080×1920，每图均分时长，
+  AAC 配乐，总时长取 `music.duration`）；实况动图（`images[].video.play_addr`，本身是 mp4）
+  另存为 `动图N.mp4`，全为动图时跳过合成
 - 失败抛 `DouyinError`（视频本身不可下载时抛其子类 `DouyinUnavailable`），
   消息可直接展示；调用方把原因写进日志/错误里，避免被 yt-dlp 上游的模糊报错误导
 

@@ -130,8 +130,9 @@ function downloadSelected() {
           <div>
             <h3 class="video__title">{{ info.title }}</h3>
             <p class="gallery__meta">
-              <Icon name="layers" :size="12" />
+              <Icon name="film" :size="12" />
               图文帖 · 共 <strong class="mono-num">{{ info.image_count }}</strong> 张原图（无水印）
+              <template v-if="info.animated_count"> · 含 {{ info.animated_count }} 张实况动图</template>
               <template v-if="info.uploader"> · {{ info.uploader }}</template>
             </p>
           </div>
@@ -141,14 +142,20 @@ function downloadSelected() {
             @click="emit('download', { preset: 'best' })"
           >
             <Icon name="download" :size="15" />
-            下载全部 {{ info.image_count }} 张
+            下载为视频
           </button>
         </header>
 
         <p class="gallery__hint">
           <Icon name="info" :size="12" />
-          图片将保存到 <code>{{ info.title }}/</code> 目录，命名为
-          <code>图片1.{{ galleryItems[0]?.ext || 'jpeg' }}</code> 依次排列。
+          将保存为<strong>视频</strong>：<code>{{ info.title }}.mp4</code>
+          （{{ info.image_count }} 张图轮播
+          <template v-if="info.music_url">＋配乐</template>
+          ，时长 {{ Math.round(info.video_duration || 0) }}s），
+          同时保留原图到 <code>{{ info.title }}/</code> 目录。
+          <template v-if="info.animated_count">
+            其中 {{ info.animated_count }} 张实况会另存为 <code>动图N.mp4</code>。
+          </template>
         </p>
 
         <ul class="gallery__grid">

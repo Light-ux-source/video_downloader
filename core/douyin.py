@@ -127,6 +127,8 @@ VIDEO_URI_RE = re.compile(r'"play_addr":\{"uri":"(v0[0-9a-zA-Z]+)"')
 DESC_RE = re.compile(r'"desc":"(.*?)","create_time"')
 AUTHOR_RE = re.compile(r'"nickname":"(.*?)"')
 LIKES_RE = re.compile(r'"digg_count":(\d+)')
+# 配乐直链（实测形如 https://lf26-music-east.douyinstatic.com/obj/ies-music-hj/<id>.mp3）
+MUSIC_URL_RE = re.compile(r'https://[a-z0-9-]*music[a-z0-9-]*\.douyinstatic\.com/[^"\s\\]+\.mp3')
 
 
 class DouyinError(RuntimeError):
@@ -584,6 +586,39 @@ def image_extension(url: str) -> str:
     return "jpg"
 
 
+def parse_music_duration(html: str) -> float | None:
+    """从分享页的 music 对象里取配乐时长（秒）。
+
+    图文帖的 `music.duration` 就是抖音客户端播放该帖的时长，
+    用它作为合成视频的总时长最贴近官方效果。
+    """
+    pos = html.find('"music":{')
+    if pos < 0:
+        return None
+    begin = html.index("{", pos)
+    depth = 0
+    end = None
+    for idx in range(begin, len(html)):
+        if html[idx] == "{":
+            depth += 1
+        elif html[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    if end is None:
+        return None
+    segment = html[begin:end].replace("\\u002F", "/")
+    match = re.search(r'"duration":(\d+)', segment)
+    if not match:
+        return None
+    value = int(match.group(1))
+    if value <= 0:
+        return None
+    # 抖音给的通常是秒；极小概率给毫秒
+    return value / 1000 if value > 10000 else float(value)
+
+
 def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
     """把分享页里的 images 数组转成归一化的图集结果。
 
@@ -597,6 +632,11 @@ def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
     title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
     author = AUTHOR_RE.search(html)
     likes = LIKES_RE.search(html)
+
+    # 配乐：图文帖本身没有视频流，但带背景音乐，用于本地合成视频
+    music_match = MUSIC_URL_RE.search(html)
+    music_url = music_match.group(0).replace("\\u002F", "/") if music_match else None
+    music_duration = parse_music_duration(html)
 
     items: list[dict[str, Any]] = []
     formats: list[dict[str, Any]] = []
@@ -662,10 +702,20 @@ def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
         "formats": formats,
         "presets": [],
         "image_count": len(items),
-        # 下载所需的全部信息（tasks 会据此直接抓图，不走 yt-dlp）
+        "animated_count": sum(1 for i in items if i.get("animated_url")),
+        # 下载所需的全部信息（tasks 会据此本地合成视频）
         "images": items,
+        "music_url": music_url,
+        "music_duration": music_duration,
+        # 幻灯片视频总时长：优先用配乐时长（与抖音客户端播放效果一致），
+        # 没有配乐时按每张图 5 秒估算
+        "video_duration": music_duration or max(len(items), 1) * 5.0,
         "direct_headers": {"Referer": CDN_REFERER, "User-Agent": UA_IPHONE},
-        "note": f"抖音图文帖：共 {len(items)} 张原图（无水印），将逐张下载",
+        "note": (
+            f"抖音图文帖：共 {len(items)} 张原图（无水印）"
+            + ("，含实况动图" if any(i.get("animated_url") for i in items) else "")
+            + "，将本地合成为视频"
+        ),
     }
 
 

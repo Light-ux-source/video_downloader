@@ -46,6 +46,98 @@ PHASE_TEXT = {
 # 多策略重试之间的退避基数（秒）：第 N 次重试前等待 N*基数
 RETRY_BACKOFF_SECONDS = 5.0
 
+def fetch_to_file(task: "Task", fetch, url, target: Path, index: int) -> bool:
+    """下载单个文件，逐条链接容错；成功返回 True。"""
+    if not url:
+        return False
+    try:
+        data = fetch(url)
+    except Exception as exc:  # noqa: BLE001
+        task.log.append(f"# 第 {index} 个文件下载失败：{exc}")
+        return False
+    if not data:
+        return False
+    try:
+        target.write_bytes(data)
+    except OSError as exc:
+        task.log.append(f"# 第 {index} 个文件写入失败：{exc}")
+        return False
+    task.downloaded_bytes += len(data)
+    return True
+
+
+def compose_slideshow_video(
+    images: list[Path],
+    music: Path | None,
+    output: Path,
+    duration: float,
+    log: list[str],
+    width: int = 1080,
+    height: int = 1920,
+    fps: int = 30,
+) -> tuple[bool, str]:
+    """用 ffmpeg 把「图片轮播 + 配乐」合成为一个 mp4。
+
+    竖屏 1080x1920（图片按比例缩放后居中留黑边），H.264 + AAC。
+    `duration` 为总时长，各图平均分配。
+    """
+    import shutil
+    import subprocess
+
+    if not images:
+        return False, "没有可用图片"
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False, "未找到 ffmpeg（高清/合成功能需要它：brew install ffmpeg）"
+
+    # 每张图生成一段固定时长的片段，再拼接：比单输入 loop 更能精确分配时间
+    import tempfile
+
+    per_image = max(duration / len(images), 0.5)
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,fps={fps},format=yuv420p"
+    )
+    seg_dir = Path(tempfile.mkdtemp(prefix="vh_slide_"))
+    try:
+        segments: list[Path] = []
+        for idx, image in enumerate(images, 1):
+            segment = seg_dir / f"seg{idx}.mp4"
+            cmd = [
+                ffmpeg, "-y", "-v", "error",
+                "-loop", "1", "-framerate", str(fps), "-t", f"{per_image:.3f}", "-i", str(image),
+                "-vf", vf, "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                str(segment),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0 or not segment.exists():
+                return False, f"第 {idx} 张图编码失败：{(result.stderr or '')[:160]}"
+            segments.append(segment)
+
+        list_file = seg_dir / "list.txt"
+        list_file.write_text(
+            "".join(f"file '{seg.as_posix()}'\n" for seg in segments), encoding="utf-8"
+        )
+
+        cmd = [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(list_file)]
+        if music and music.exists():
+            cmd += ["-i", str(music)]
+        cmd += ["-c:v", "copy"]
+        if music and music.exists():
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
+        cmd += ["-movflags", "+faststart", "-t", f"{duration:.3f}", str(output)]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if result.returncode != 0 or not output.exists():
+            return False, (result.stderr or "ffmpeg 合并失败")[:200]
+        log.append(f"# 已合成视频：{output.name}（{len(images)} 张图 · {duration:.1f}s · 含配乐）")
+        return True, ""
+    finally:
+        shutil.rmtree(seg_dir, ignore_errors=True)
+
+
 def _safe_folder_name(raw: str) -> str:
     """把标题变成安全的目录名（去掉路径分隔符与非法字符）。"""
     name = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", str(raw or "")).strip(" .")
@@ -594,16 +686,23 @@ class TaskManager:
         if not task.thumbnail:
             task.thumbnail = info.get("thumbnail")
 
-        # 图文帖：是一组图片，交给原生下载逻辑（不走 yt-dlp）
+        # 图文帖：本身没有视频流，但客户端播放的是「图片轮播 + 配乐」，
+        # 因此这里把素材交给原生逻辑本地合成视频（不走 yt-dlp）。
         if info.get("kind") == "gallery" and info.get("images"):
+            animated = int(info.get("animated_count") or 0)
             task.options = {
                 **task.options,
                 "_source_url": original,
                 "_douyin_images": info["images"],
                 "_douyin_headers": info.get("direct_headers") or {},
+                "_douyin_music": info.get("music_url"),
+                "_douyin_duration": info.get("video_duration"),
             }
+            task.playlist_total = len(info["images"]) + (0 if animated == len(info["images"]) else 1)
             task.log.append(
-                f"# 抖音图文帖：共 {len(info['images'])} 张原图（无水印），将逐张下载"
+                f"# 抖音图文帖：共 {len(info['images'])} 张原图"
+                + (f"（含 {animated} 张实况动图）" if animated else "")
+                + f"，配乐时长 {info.get('music_duration') or '未知'}s，将本地合成为视频"
             )
             self._emit(task)
             return
@@ -666,11 +765,17 @@ class TaskManager:
         return result
 
     def _download_douyin_gallery(self, task: Task, download_dir: Path) -> None:
-        """下载抖音图文帖的全部原图。
+        """把抖音图文帖保存为视频。
 
-        图片不是流媒体，交给 yt-dlp 反而绕远：这里直接用 urllib 逐张抓取，
-        并复用统一的收尾逻辑判定结果。产物放在 `{标题}/图片N.扩展名` 子目录里，
-        便于一次图文帖的图片聚合在一起。
+        图文帖本身没有视频流（帖子级 video 只有封面，bit_rate 为空），
+        但客户端播放的是一个"图片轮播 + 配乐"的视频。因此这里：
+
+          1. 下载全部无水印原图（实测 `url_list` 的 .jpeg）
+          2. 若某张图带动图（实况），下载它对应的 mp4（`images[].video.play_addr`）
+          3. 生成一个幻灯片视频：图片 + 配乐，时长取抖音给的播放时长
+             —— 全为动图时跳过合成，直接保存动画视频
+
+        产物统一放在 `downloads/{标题}/` 下，与其他任务的收尾校验共用同一套逻辑。
         """
         import urllib.request
 
@@ -678,11 +783,8 @@ class TaskManager:
 
         images: list[dict[str, Any]] = list(task.options.get("_douyin_images") or [])
         headers = dict(task.options.get("_douyin_headers") or {})
-        total = len(images)
-        task.playlist_total = total
-        task.phase = PHASE_DOWNLOADING
-        task.message = f"开始下载 {total} 张原图"
-        self._emit(task)
+        music_url = task.options.get("_douyin_music")
+        duration = float(task.options.get("_douyin_duration") or 0) or max(len(images), 1) * 5.0
 
         folder = download_dir / _safe_folder_name(task.title or task.url)
         try:
@@ -695,55 +797,97 @@ class TaskManager:
         produced: list[str] = []
         failures: list[str] = []
 
+        def fetch(url: str, timeout: int = 90) -> bytes:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+
+        task.phase = PHASE_DOWNLOADING
+        all_animated = bool(images) and all(i.get("animated_url") for i in images)
+        task.playlist_total = len(images) if all_animated else len(images) + 1
+        self._emit(task)
+
+        # ---- 1) 下载原图 / 动图视频 ----
         for index, image in enumerate(images, 1):
             if task.state == STATE_CANCELED:
                 return
-            urls = [u for u in ([image.get("url")] + list(image.get("urls") or [])) if u]
-            ext = image.get("ext") or "jpg"
-            target = folder / f"图片{index}.{ext}"
-            task.message = f"下载第 {index}/{total} 张原图"
-            task.percent = round((index - 1) / max(total, 1) * 100, 2)
+            animated = image.get("animated_url")
+            task.message = f"下载第 {index}/{len(images)} 张" + ("（实况动图）" if animated else "原图")
+            task.percent = round((index - 1) / max(task.playlist_total, 1) * 100, 2)
+            self._emit(task)
 
-            written = False
-            for url in urls:
-                try:
-                    request = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(request, timeout=60) as response:
-                        data = response.read()
-                    if not data:
-                        continue
-                    target.write_bytes(data)
-                    task.downloaded_bytes += len(data)
+            if animated:
+                target = folder / f"动图{index}.mp4"
+                written = fetch_to_file(task, fetch, animated, target, index)
+                if written:
                     produced.append(str(target))
-                    written = True
-                    break
-                except Exception as exc:  # noqa: BLE001 - 逐张容错，单张失败不影响其余
-                    task.log.append(f"# 第 {index} 张下载失败（换下一条链接）：{exc}")
-                    continue
-            if not written:
+                else:
+                    failures.append(f"第 {index} 张动图")
+                continue
+
+            target = folder / f"图片{index}.{image.get('ext') or 'jpg'}"
+            written = fetch_to_file(task, fetch, image.get("url"), target, index)
+            if written:
+                produced.append(str(target))
+            else:
                 failures.append(f"第 {index} 张")
-                task.warnings += 1
 
             task.item_index = index
-            task.percent = round(index / max(total, 1) * 100, 2)
             task.updated_at = time.time()
             self._emit(task)
 
-        # 写出产物清单，复用 _finalize 的校验与终态处理
+        # ---- 2) 合成视频（图片 + 配乐） ----
+        if not all_animated and produced:
+            task.message = "正在合成视频（图片 + 配乐）"
+            task.phase = PHASE_CONVERTING
+            self._emit(task)
+
+            music_path = None
+            if music_url:
+                music_path = folder / ".music.mp3"
+                try:
+                    music_path.write_bytes(fetch(music_url, timeout=120))
+                except Exception as exc:  # noqa: BLE001 - 配乐失败不影响画面
+                    task.log.append(f"# 配乐下载失败，将生成无声视频：{exc}")
+                    music_path = None
+
+            video_path = folder / f"{_safe_folder_name(task.title or task.url)}.mp4"
+            ok, err = compose_slideshow_video(
+                [Path(p) for p in produced if p.endswith((".jpg", ".jpeg", ".webp", ".png"))],
+                music_path,
+                video_path,
+                duration,
+                task.log,
+            )
+            if ok:
+                produced.insert(0, str(video_path))
+                if music_path:
+                    try:
+                        music_path.unlink()
+                    except OSError:
+                        pass
+            else:
+                failures.append("视频合成")
+                task.log.append(f"# 视频合成失败：{err}")
+
+            task.item_index = len(produced)
+            task.updated_at = time.time()
+            self._emit(task)
+
+        # ---- 3) 收尾（复用统一校验） ----
         try:
             result_file.write_text("\n".join(produced) + "\n", encoding="utf-8")
         except OSError:
             pass
-
         if failures:
-            task.log.append(f"# {len(failures)} 张图片下载失败：{', '.join(failures[:6])}")
+            task.log.append(f"# 失败项：{', '.join(failures[:6])}")
             task.failed_items = len(failures)
 
-        self._finalize(
-            task, folder, result_file, time.time() - 1, set(), audio_only=False
-        )
+        self._finalize(task, folder, result_file, time.time() - 1, set(), audio_only=False)
         if not task.incomplete and produced:
-            task.message = f"全部完成：共 {len(produced)} 张原图"
+            task.message = f"全部完成：共 {len(produced)} 个文件" + (
+                "（含合成视频）" if not all_animated else "（实况动图）"
+            )
             self._emit(task)
 
     def _spawn_engine(

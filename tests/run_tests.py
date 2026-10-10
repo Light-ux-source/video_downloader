@@ -24,7 +24,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core import config, douyin, server, ytdlp  # noqa: E402
-from core.tasks import _safe_folder_name  # noqa: E402
+from core.tasks import (  # noqa: E402
+    _safe_folder_name,
+    compose_slideshow_video,
+    fetch_to_file,
+)
 from core.tasks import (  # noqa: E402
     STATE_CANCELED,
     STATE_DONE,
@@ -408,7 +412,11 @@ def test_douyin(tmp: Path) -> None:
           all(i.get("url") and i.get("ext") and i.get("width") for i in gallery["images"]))
     check("图集 formats 逐张列出",
           len(gallery["formats"]) == 2 and gallery["formats"][0]["format_id"] == "douyin-image-1")
-    check("图集不使用 direct_url（走原生下载）", "direct_url" not in gallery)
+    check("图集不使用 direct_url（改为本地合成视频）", "direct_url" not in gallery)
+    check("图集带配乐时长用于合成", "video_duration" in gallery and "music_url" in gallery,
+          f"→ {gallery.get('music_url')} / {gallery.get('video_duration')}")
+    check("无配乐时按每张 5 秒估算", gallery["video_duration"] >= len(gallery["images"]) * 5 - 0.01,
+          f"→ {gallery['video_duration']}")
     check("纯视频页面不会被当成图集",
           douyin.extract_gallery('{"play_addr":{"uri":"v0abc"}}', "1") is None)
 
@@ -421,6 +429,71 @@ def test_douyin(tmp: Path) -> None:
     check("图集目录名安全化", _safe_folder_name('#厦门/测试') == "#厦门_测试",
           f"→ {_safe_folder_name('#厦门/测试')}")
     check("空标题有兜底目录名", _safe_folder_name("") == "douyin")
+
+    section("抖音配乐时长解析")
+    check("从 music 对象取时长", douyin.parse_music_duration('{"music":{"duration":26,"title":"x"}}') == 26.0)
+    check("毫秒值会换算成秒", douyin.parse_music_duration('{"music":{"duration":26000}}') == 26.0)
+    check("无 music 返回 None", douyin.parse_music_duration('{"video":{}}') is None)
+    check("duration 为 0 返回 None", douyin.parse_music_duration('{"music":{"duration":0}}') is None)
+    check("嵌套花括号也能正确配平",
+          douyin.parse_music_duration('{"music":{"a":{"b":1},"duration":12}}') == 12.0)
+
+    section("图文帖合成视频")
+    import subprocess as _sp
+    import shutil as _sh
+    work_img = tmp / "slide"
+    work_img.mkdir(parents=True, exist_ok=True)
+    # 造两张纯色测试图
+    if _sh.which("ffmpeg"):
+        for idx, color in ((1, "red"), (2, "blue")):
+            _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                     "-i", f"color=c={color}:s=320x480:d=1", "-frames:v", "1",
+                     str(work_img / f"图片{idx}.jpg")], timeout=60)
+        out = work_img / "合成.mp4"
+        ok, err = compose_slideshow_video(
+            [work_img / "图片1.jpg", work_img / "图片2.jpg"], None, out, 4.0, []
+        )
+        check("无配乐也能合成视频", ok and out.exists(), f"→ {err}")
+        if out.exists():
+            probe = _sp.run(["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration:stream=codec_type,codec_name,width,height",
+                             "-of", "json", str(out)], capture_output=True, text=True)
+            meta = json.loads(probe.stdout)
+            streams = {s["codec_type"]: s for s in meta["streams"]}
+            check("合成视频含 h264 视频流", streams.get("video", {}).get("codec_name") == "h264")
+            check("合成视频为竖屏 1080x1920",
+                  streams.get("video", {}).get("width") == 1080
+                  and streams.get("video", {}).get("height") == 1920,
+                  f"→ {streams.get('video', {}).get('width')}x{streams.get('video', {}).get('height')}")
+            dur = float(meta["format"]["duration"])
+            check("合成视频时长符合预期", 3.5 <= dur <= 4.6, f"→ {dur:.2f}s")
+        check("无图片时返回失败", compose_slideshow_video([], None, work_img / "x.mp4", 3, [])[0] is False)
+    else:
+        check("ffmpeg 可用（合成前提前提）", False, "未找到 ffmpeg")
+
+    section("图文帖单文件下载")
+    manager_dl = TaskManager(concurrency=1)
+    dl_task = manager_dl.create("https://example.com/x", {"preset": "best"})
+    target = tmp / "dl" / "图片1.jpg"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def ok_fetch(_url):
+        return b"x" * 1024
+
+    check("下载成功返回 True", fetch_to_file(dl_task, ok_fetch, "https://x/a.jpg", target, 1) is True)
+    check("文件已写入", target.is_file() and target.stat().st_size == 1024)
+    check("累计下载字节数", dl_task.downloaded_bytes == 1024, f"→ {dl_task.downloaded_bytes}")
+
+    def boom_fetch(_url):
+        raise OSError("connection reset")
+
+    check("下载异常返回 False 而非抛出",
+          fetch_to_file(dl_task, boom_fetch, "https://x/b.jpg", tmp / "dl" / "b.jpg", 2) is False)
+    check("空响应返回 False",
+          fetch_to_file(dl_task, lambda _u: b"", "https://x/c.jpg", tmp / "dl" / "c.jpg", 3) is False)
+    check("无链接返回 False",
+          fetch_to_file(dl_task, ok_fetch, None, tmp / "dl" / "d.jpg", 4) is False)
+    manager_dl.shutdown()
 
     section("抖音文件名规范化")
     manager = TaskManager(concurrency=1)
