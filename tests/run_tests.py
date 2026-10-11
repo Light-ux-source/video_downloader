@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from core import config, douyin, server, ytdlp  # noqa: E402
 from core.tasks import (  # noqa: E402
+    _probe_streams,
     _safe_folder_name,
     compose_slideshow_video,
     fetch_to_file,
@@ -468,6 +469,61 @@ def test_douyin(tmp: Path) -> None:
             dur = float(meta["format"]["duration"])
             check("合成视频时长符合预期", 3.5 <= dur <= 4.6, f"→ {dur:.2f}s")
         check("无图片时返回失败", compose_slideshow_video([], None, work_img / "x.mp4", 3, [])[0] is False)
+
+        # ---- 配乐相关（回归：图文帖丢失背景音乐）----
+        # 造一段测试配乐
+        test_music = work_img / "music.mp3"
+        _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=440:duration=8", "-c:a", "libmp3lame",
+                 str(test_music)], timeout=60)
+
+        with_music = work_img / "有声.mp4"
+        ok_m, err_m = compose_slideshow_video(
+            [work_img / "图片1.jpg", work_img / "图片2.jpg"], test_music, with_music, 8.0, []
+        )
+        streams_m = _probe_streams(with_music)
+        check("带配乐合成成功", ok_m and with_music.exists(), f"→ {err_m}")
+        check("合成产物确实含音轨（回归：丢失 BGM）",
+              "audio" in streams_m, f"→ {streams_m}")
+        check("音轨编解码为 aac",
+              _sp.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                       "stream=codec_name", "-of", "csv=p=0", str(with_music)],
+                      capture_output=True, text=True).stdout.strip() == "aac")
+
+        # 损坏的配乐文件：必须报错，绝不能合出无声视频还报成功
+        broken = work_img / "broken.mp3"
+        broken.write_bytes(b"this is not audio")
+        ok_b, err_b = compose_slideshow_video(
+            [work_img / "图片1.jpg"], broken, work_img / "坏配乐.mp4", 6.0, []
+        )
+        check("配乐损坏时明确报错", ok_b is False and "无法解码" in err_b, f"→ {err_b}")
+
+        # 配乐短于视频：用 apad 补静音，不能把视频截断
+        short_music = work_img / "short.mp3"
+        _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=440:duration=2", "-c:a", "libmp3lame",
+                 str(short_music)], timeout=60)
+        padded = work_img / "补静音.mp4"
+        ok_p, _ = compose_slideshow_video(
+            [work_img / "图片1.jpg", work_img / "图片2.jpg"], short_music, padded, 10.0, []
+        )
+        dur_p = float(_sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", str(padded)],
+                              capture_output=True, text=True).stdout.strip() or 0)
+        check("配乐短于视频时不截断且保留音轨",
+              ok_p and dur_p > 9 and "audio" in _probe_streams(padded),
+              f"→ {dur_p:.1f}s {_probe_streams(padded)}")
+
+        # 无配乐：允许无声，但必须留下记录
+        silent = work_img / "无声.mp4"
+        log_silent: list[str] = []
+        ok_s, _ = compose_slideshow_video(
+            [work_img / "图片1.jpg"], None, silent, 5.0, log_silent
+        )
+        check("无配乐时生成无声视频",
+              ok_s and "audio" not in _probe_streams(silent))
+        check("无声情况有日志记录",
+              any("无声" in line for line in log_silent), f"→ {log_silent}")
     else:
         check("ffmpeg 可用（合成前提前提）", False, "未找到 ffmpeg")
 

@@ -107,7 +107,10 @@ yt-dlp 的抖音提取器撞签名墙（`encrypt_data_miss` / 403），因此单
   但客户端播放的是「图片轮播 + 配乐」，因此由 `tasks._download_douyin_gallery()` 下载素材后，
   用 `compose_slideshow_video()` 本地合成 `{标题}.mp4`（竖屏 1080×1920，每图均分时长，
   AAC 配乐，总时长取 `music.duration`）；实况动图（`images[].video.play_addr`，本身是 mp4）
-  另存为 `动图N.mp4`，全为动图时跳过合成
+  另存为 `动图N.mp4`，全为动图时跳过合成。
+  合成环节对"配乐完整性"做了硬保证：素材下载走任务配置的代理、配乐先校验可解码、
+  ffmpeg 显式 `-map` 音视频流、`apad` 防截断、合成后 ffprobe 校验产物含音轨
+  （缺失则换方案重试，仍失败则标记任务未完成并说明原因），避免"以为有配乐实际无声"
 - 失败抛 `DouyinError`（视频本身不可下载时抛其子类 `DouyinUnavailable`），
   消息可直接展示；调用方把原因写进日志/错误里，避免被 yt-dlp 上游的模糊报错误导
 

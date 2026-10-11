@@ -66,6 +66,27 @@ def fetch_to_file(task: "Task", fetch, url, target: Path, index: int) -> bool:
     return True
 
 
+def _probe_streams(path: Path) -> list[str]:
+    """返回媒体文件里的流类型列表（如 ['video', 'audio']）；失败返回空列表。"""
+    import shutil
+    import subprocess
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not path.exists():
+        return []
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
 def compose_slideshow_video(
     images: list[Path],
     music: Path | None,
@@ -78,20 +99,30 @@ def compose_slideshow_video(
 ) -> tuple[bool, str]:
     """用 ffmpeg 把「图片轮播 + 配乐」合成为一个 mp4。
 
-    竖屏 1080x1920（图片按比例缩放后居中留黑边），H.264 + AAC。
-    `duration` 为总时长，各图平均分配。
+    竖屏 1080x1920（图片等比缩放后居中留黑边），H.264 + AAC。
+
+    设计要点（都是为了"绝不静默丢配乐"）：
+      * 先校验配乐文件确实是可解码音频，坏文件立即报错而不是合出无声视频
+      * 显式 `-map` 指定视频与音频流，避免默认流选择把配乐丢掉
+      * 合完再 ffprobe 校验产物**确实含音轨**；没有就换方案重试
+      * 仍然没有音轨则返回失败（调用方会告知用户），而不是当作成功
     """
     import shutil
     import subprocess
+    import tempfile
 
     if not images:
         return False, "没有可用图片"
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        return False, "未找到 ffmpeg（高清/合成功能需要它：brew install ffmpeg）"
+        return False, "未找到 ffmpeg（合成功能需要它：brew install ffmpeg）"
 
-    # 每张图生成一段固定时长的片段，再拼接：比单输入 loop 更能精确分配时间
-    import tempfile
+    want_audio = bool(music and Path(music).exists())
+    if want_audio and "audio" not in _probe_streams(Path(music)):
+        # 配乐文件损坏/不是音频：明确指出，避免合出无声视频还报成功
+        return False, "配乐文件无法解码（下载可能不完整）"
+    if not want_audio:
+        log.append("# 未获取到配乐，将生成无声视频")
 
     per_image = max(duration / len(images), 0.5)
     vf = (
@@ -101,17 +132,18 @@ def compose_slideshow_video(
     )
     seg_dir = Path(tempfile.mkdtemp(prefix="vh_slide_"))
     try:
+        # ---- 1) 每张图编码成固定时长的无声片段 ----
         segments: list[Path] = []
         for idx, image in enumerate(images, 1):
             segment = seg_dir / f"seg{idx}.mp4"
-            cmd = [
-                ffmpeg, "-y", "-v", "error",
-                "-loop", "1", "-framerate", str(fps), "-t", f"{per_image:.3f}", "-i", str(image),
-                "-vf", vf, "-an",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-                str(segment),
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = subprocess.run(
+                [ffmpeg, "-y", "-v", "error",
+                 "-loop", "1", "-framerate", str(fps), "-t", f"{per_image:.3f}", "-i", str(image),
+                 "-vf", vf, "-an",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                 str(segment)],
+                capture_output=True, text=True, timeout=600,
+            )
             if result.returncode != 0 or not segment.exists():
                 return False, f"第 {idx} 张图编码失败：{(result.stderr or '')[:160]}"
             segments.append(segment)
@@ -121,19 +153,58 @@ def compose_slideshow_video(
             "".join(f"file '{seg.as_posix()}'\n" for seg in segments), encoding="utf-8"
         )
 
-        cmd = [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(list_file)]
-        if music and music.exists():
-            cmd += ["-i", str(music)]
-        cmd += ["-c:v", "copy"]
-        if music and music.exists():
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
-        cmd += ["-movflags", "+faststart", "-t", f"{duration:.3f}", str(output)]
+        # ---- 2) 拼接 + 混入配乐（显式 map，两种封装依次尝试）----
+        attempts: list[tuple[str, list[str]]] = []
+        if want_audio:
+            attempts.append(("copy", [
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-af", "apad",           # 配乐短于视频时补静音，而不是截断
+                "-shortest",
+            ]))
+            attempts.append(("reencode", [
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-af", "apad",
+                "-shortest",
+            ]))
+        else:
+            attempts.append(("silent", ["-map", "0:v:0", "-c:v", "copy", "-an"]))
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if result.returncode != 0 or not output.exists():
-            return False, (result.stderr or "ffmpeg 合并失败")[:200]
-        log.append(f"# 已合成视频：{output.name}（{len(images)} 张图 · {duration:.1f}s · 含配乐）")
-        return True, ""
+        last_error = ""
+        for label, extra in attempts:
+            cmd = [ffmpeg, "-y", "-v", "error",
+                   "-f", "concat", "-safe", "0", "-i", str(list_file)]
+            if want_audio:
+                cmd += ["-i", str(music)]
+            cmd += extra + ["-movflags", "+faststart", "-t", f"{duration:.3f}", str(output)]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                last_error = "ffmpeg 执行超时"
+                continue
+            if result.returncode != 0 or not output.exists():
+                last_error = (result.stderr or "ffmpeg 合并失败")[:200]
+                continue
+            # 校验产物：要求音频真的在里面
+            streams = _probe_streams(output)
+            if "video" not in streams:
+                last_error = "产物缺少视频流"
+                continue
+            if want_audio and "audio" not in streams:
+                last_error = f"{label} 方案合成后仍丢失音轨"
+                log.append(f"# 音轨校验失败（{label}），换方案重试：{last_error}")
+                try:
+                    output.unlink()
+                except OSError:
+                    pass
+                continue
+            log.append(
+                f"# 已合成视频：{output.name}（{len(images)} 张图 · {duration:.1f}s"
+                + ("· 含配乐" if want_audio else "· 无声") + f"· {label}）"
+            )
+            return True, ""
+        return False, last_error or "合成失败"
     finally:
         shutil.rmtree(seg_dir, ignore_errors=True)
 
@@ -777,6 +848,7 @@ class TaskManager:
 
         产物统一放在 `downloads/{标题}/` 下，与其他任务的收尾校验共用同一套逻辑。
         """
+        import http.cookiejar
         import urllib.request
 
         from . import douyin
@@ -797,9 +869,14 @@ class TaskManager:
         produced: list[str] = []
         failures: list[str] = []
 
+        # 走任务里配置的代理与游客 cookie：
+        # 抖音 CDN 在部分网络下必须经代理才通，否则素材（尤其配乐）会下载失败。
+        proxy = ytdlp.sanitize_proxy(task.options.get("proxy")) if task.options.get("proxy") else None
+        opener = douyin._build_opener(proxy, http.cookiejar.CookieJar())
+
         def fetch(url: str, timeout: int = 90) -> bytes:
             request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with opener.open(request, timeout=timeout) as response:
                 return response.read()
 
         task.phase = PHASE_DOWNLOADING
@@ -843,13 +920,24 @@ class TaskManager:
             self._emit(task)
 
             music_path = None
+            music_failed_reason = ""
             if music_url:
                 music_path = folder / ".music.mp3"
                 try:
-                    music_path.write_bytes(fetch(music_url, timeout=120))
-                except Exception as exc:  # noqa: BLE001 - 配乐失败不影响画面
-                    task.log.append(f"# 配乐下载失败，将生成无声视频：{exc}")
+                    data = fetch(music_url, timeout=120)
+                    if not data:
+                        raise ValueError("响应为空")
+                    music_path.write_bytes(data)
+                    task.log.append(f"# 配乐已下载：{len(data) / 1024:.1f}KB")
+                except Exception as exc:  # noqa: BLE001
+                    # 配乐拿不到会导致视频无声——必须让用户知道，不能静默降级
+                    music_failed_reason = str(exc)[:160]
+                    task.log.append(f"# ⚠ 配乐下载失败，视频将没有声音：{music_failed_reason}")
+                    task.warnings += 1
                     music_path = None
+            else:
+                music_failed_reason = "该帖子未提供配乐"
+                task.log.append("# ⚠ 未获取到配乐直链，视频将没有声音")
 
             video_path = folder / f"{_safe_folder_name(task.title or task.url)}.mp4"
             ok, err = compose_slideshow_video(
@@ -861,11 +949,21 @@ class TaskManager:
             )
             if ok:
                 produced.insert(0, str(video_path))
-                if music_path:
+                has_audio = "audio" in _probe_streams(video_path)
+                if music_path and has_audio:
                     try:
-                        music_path.unlink()
+                        music_path.unlink()   # 只有在音轨确实混入后才清理配乐
                     except OSError:
                         pass
+                if not has_audio:
+                    # 合成成功但没有声音：明确告知并计入未完成，避免"以为有配乐"
+                    reason = music_failed_reason or "合成产物不含音轨"
+                    task.log.append(f"# ⚠ 视频已生成但没有声音：{reason}")
+                    task.warnings += 1
+                    failures.append("配乐")
+                    task.last_warning = f"视频无声：{reason}"
+                elif music_failed_reason:
+                    task.last_warning = f"配乐异常但已合成：{music_failed_reason}"
             else:
                 failures.append("视频合成")
                 task.log.append(f"# 视频合成失败：{err}")
@@ -885,9 +983,17 @@ class TaskManager:
 
         self._finalize(task, folder, result_file, time.time() - 1, set(), audio_only=False)
         if not task.incomplete and produced:
-            task.message = f"全部完成：共 {len(produced)} 个文件" + (
-                "（含合成视频）" if not all_animated else "（实况动图）"
-            )
+            if all_animated:
+                task.message = f"全部完成：共 {len(produced)} 个实况动图视频"
+            else:
+                has_video = any(p.endswith(".mp4") for p in produced)
+                silent = has_video and "audio" not in _probe_streams(
+                    Path(next(p for p in produced if p.endswith(".mp4")))
+                )
+                task.message = (
+                    f"全部完成：共 {len(produced)} 个文件"
+                    + ("（合成视频无声，见日志）" if silent else "（含合成视频与配乐）")
+                )
             self._emit(task)
 
     def _spawn_engine(
