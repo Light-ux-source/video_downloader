@@ -1,5 +1,8 @@
 # 排障指南
 
+> 🤖 开发者/接手者：项目级坑清单与修改约定在 [AI_CONTEXT.md](AI_CONTEXT.md#6-已踩过的坑不要重复踩)，
+> 本文档面向"使用中遇到问题"的排查。
+>
 > 遇到问题先跑自查工具，多数情况它能直接指出原因：
 > ```bash
 > ./run.sh --py tools/verify_env.py
@@ -366,7 +369,7 @@ git config --global http.proxy http://127.0.0.1:7897
 ### 7. 运行自测
 
 ```bash
-./run.sh --py tests/run_tests.py          # 离线，126 项
+./run.sh --py tests/run_tests.py          # 离线，208 项（27 个分组）
 ./run.sh --py tests/run_tests.py --live   # 额外做真实解析与下载
 ```
 

@@ -1,5 +1,8 @@
 # 开发指南
 
+> 🤖 **接手本项目请先读 [AI_CONTEXT.md](AI_CONTEXT.md)**：那份文档汇总了当前进度、
+> 环境约束（Python 3.9 / GitHub 不可达）、已踩过的坑与修改约定；本文档侧重具体操作。
+
 ## 1. 快速开始
 
 ```bash
@@ -45,9 +48,9 @@ video_downloader/
 │  ├─ vite.config.js           # 产物输出到 ../static
 │  └─ .npmrc                   # 镜像源
 ├─ tools/verify_env.py         # 环境自查工具
-├─ tests/run_tests.py          # 后端自测（126 项）
+├─ tests/run_tests.py          # 后端自测（208 项 / 27 分组）
 ├─ static/                     # 前端构建产物（入库，clone 后免构建）
-├─ docs/                       # 文档
+├─ docs/                       # 文档（AI_CONTEXT 为 AI 接手入口）
 ├─ run.sh                      # 启动器 / 运行时包装器
 └─ setup.sh                    # 一次性环境准备
 ```
@@ -76,7 +79,7 @@ PY
 ## 4. 测试
 
 ```bash
-./run.sh --py tests/run_tests.py          # 离线：126 项，秒级
+./run.sh --py tests/run_tests.py          # 离线：208 项，秒级
 ./run.sh --py tests/run_tests.py --live   # 额外真实解析 + 真实下载（依赖外网）
 ```
 
@@ -96,6 +99,8 @@ PY
 | 错误提取与中文化 | 错误+提示成对返回、裸 ERROR 兜底、14 类错误映射 |
 | 任务状态机 | 进度/阶段推进、warnings 不覆盖提示、错误捕获、取消排队任务、失败路径、事件订阅 |
 | 收尾判定 | 抖动自愈不误报、产物缺失判部分完成、播放列表未达标、多产物计数 |
+| 抖音（10 个分组） | URL 识别、档位映射、页面数据提取、档位选择、网络异常收敛与重试、不可用原因分类、图文帖解析、配乐时长、合成视频、单文件下载、文件名规范化 |
+| 启动端口预检 | 占用端口被检出、提示含换端口/lsof/pkill、空闲端口通过、占用者探测不抛异常 |
 | HTTP 接口 | health、presets、probe 校验、任务增删查、越权路径、超量、404、SSE 首帧 |
 
 ### 写测试的注意事项

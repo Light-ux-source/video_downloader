@@ -2,6 +2,9 @@
 
 > 仓库：https://github.com/Light-ux-source/video_downloader
 >
+> 🤖 **AI / 新开发者接手请先读 [docs/AI_CONTEXT.md](docs/AI_CONTEXT.md)** —— 一页掌握
+> 项目进度、环境约束、已踩过的坑、修改约定与推送方式。
+>
 > 一个**本地运行**的视频下载工作台：粘贴链接 → 选画质 → 实时看着它下完。
 > 站点适配交给 [yt-dlp](https://github.com/yt-dlp/yt-dlp)（覆盖 1800+ 站点），
 > 我们只负责把「解析、选流、下载、合流、进度、容错」编排得顺手。
@@ -68,6 +71,7 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 
 | 文档 | 内容 |
 |---|---|
+| [docs/AI_CONTEXT.md](docs/AI_CONTEXT.md) | 🤖 **AI 接手手册**：进度状态、环境约束、坑清单、修改约定 |
 | [docs/USAGE.md](docs/USAGE.md) | **使用手册**：界面说明、参数详解、典型场景、快捷键 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **架构设计**：分层、模块职责、任务生命周期、扩展指引 |
 | [docs/API.md](docs/API.md) | **API 参考**：全部接口、字段表、SSE 协议、错误码 |
@@ -100,9 +104,13 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 
 ## 项目状态
 
-- 后端自测：**126 项全部通过**（`./run.sh --py tests/run_tests.py`）
-- 真实站点验证：B 站（视频/音频/播放列表）、YouTube（1080p 全画质）均实测通过
-- 抖音：✅ 已有专用免 Cookie 通道（yt-dlp 自身仍不支持，我们绕过了签名墙）
+- 后端自测：**208 项全部通过**（27 个分组，`./run.sh --py tests/run_tests.py`）
+- 真实站点验证：
+  - **B 站**：视频（360P–1080P）/ 音频 MP3 / 播放列表均实测通过，`ffprobe` 校验产物
+  - **YouTube**：解析 80 个画质、真实下载通过（需 node + 代理）
+  - **抖音**：视频（免 Cookie、无水印 1080p）与**图文帖**（合成为视频、含配乐）均实测通过
+- 已知未验证项（见 [AI 接手手册](docs/AI_CONTEXT.md#3-当前进度与状态)）：
+  抖音多图帖节奏、抖音实况动图、普通字幕内嵌的真实成功案例
 
 ---
 
