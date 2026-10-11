@@ -25,10 +25,13 @@ sys.path.insert(0, str(ROOT))
 
 from core import config, douyin, server, ytdlp  # noqa: E402
 from core.tasks import (  # noqa: E402
+    _audio_ext_from_response,
     _probe_streams,
     _safe_folder_name,
     compose_slideshow_video,
+    download_douyin_music,
     fetch_to_file,
+    is_usable_audio,
 )
 from core.tasks import (  # noqa: E402
     STATE_CANCELED,
@@ -526,6 +529,169 @@ def test_douyin(tmp: Path) -> None:
               any("无声" in line for line in log_silent), f"→ {log_silent}")
     else:
         check("ffmpeg 可用（合成前提前提）", False, "未找到 ffmpeg")
+
+    section("抖音分享页内联 JSON 解析（图文帖配乐的稳定通道）")
+    # 真实页面片段：/ 被转义为 \\u002F，且 JSON 里含嵌套对象与数组
+    real_json = (
+        '{"videoInfoRes":{"extra":{"logid":"x"},"filter_list":[],'
+        '"item_list":[{"aweme_id":"7628245670093444826","desc":"长路奉献给远方。#干河坝",'
+        '"author":{"nickname":"BB.Z"},"statistics":{"digg_count":106086},'
+        '"music":{"mid":"7041539337137179429","duration":16,"title":"奉献"},'
+        '"video":{"play_addr":{"uri":"https:\\u002F\\u002Fsf6-cdn-tos.douyinstatic.com'
+        '\\u002Fobj\\u002Ftos-cn-ve-2774\\u002FoIgHzeDaDoLQAift4fbAmKMFzNO5GnGjBI8ACQ",'
+        '"url_list":["https:\\u002F\\u002Faweme.snssdk.com\\u002Faweme\\u002Fv1\\u002Fplaywm\\u002F"]},'
+        '"duration":0},"images":[{"uri":"k","width":1,"height":1,'
+        '"url_list":["https:\\u002F\\u002Fp3-sign.douyinpic.com\\u002Fk~tplv-dy-lqen-new:1440:2560:q80.jpeg"]}]}]}}'
+        ',"other":{"images":[{"x":1}]}'
+    )
+    item = douyin.extract_item(real_json)
+    check("解析出作品对象", isinstance(item, dict) and item.get("aweme_id") == "7628245670093444826",
+          f"→ {type(item).__name__}")
+    check("从 JSON 取标题/作者/点赞",
+          douyin._item_str(item, "desc") == "长路奉献给远方。#干河坝"
+          and douyin._item_author(item) == "BB.Z"
+          and douyin._item_like_count(item) == 106086)
+    check("从 JSON 取配乐时长（秒）", douyin._music_duration_seconds(item) == 16.0,
+          f"→ {douyin._music_duration_seconds(item)}")
+    check("毫秒时长会换算", douyin._music_duration_seconds({"music": {"duration": 16000}}) == 16.0)
+    check("缺字段返回 None / 空串",
+          douyin._music_duration_seconds({}) is None
+          and douyin._music_duration_seconds(None) is None
+          and douyin._item_author({}) is None
+          and douyin._item_like_count(None) is None
+          and douyin._item_str(None, "desc") == "")
+    check("结构不对（无 videoInfoRes）返回 None",
+          douyin.extract_item('{"a":1}') is None)
+    check("item_list 为空返回 None", douyin.extract_item('{"videoInfoRes":{"item_list":[]}}') is None)
+
+    section("抖音配乐候选来源（多源兜底）")
+    # ① 关键回归：配乐 CDN 域名不含 music、且地址无 .mp3 后缀 → 旧正则必然漏掉
+    item_noext = {
+        "music": {"mid": "7041539337137179429", "duration": 16},
+        "video": {"play_addr": {"uri": "https://sf6-cdn-tos.douyinstatic.com"
+                                        "/obj/tos-cn-ve-2774/oIgHzeDaDoLQAift4fb"}},
+    }
+    cands = douyin._audio_url_candidates(item_noext, "")
+    check("能从 video.play_addr.uri 取到配乐（域名不含 music 也算）",
+          bool(cands) and cands[0] == "https://sf6-cdn-tos.douyinstatic.com"
+                                     "/obj/tos-cn-ve-2774/oIgHzeDaDoLQAift4fb",
+          f"→ {cands[:1]}")
+    check("music.play_url 为空时不再返回 None", douyin.extract_gallery(
+        '{"images":[{"url_list":["https:\\u002F\\u002Fp3.douyinpic.com\\u002Fx.jpeg?y=1"]}]}'
+        + real_json, "1")["music_candidates"][0]
+        == "https://sf6-cdn-tos.douyinstatic.com/obj/tos-cn-ve-2774/"
+           "oIgHzeDaDoLQAift4fbAmKMFzNO5GnGjBI8ACQ")
+
+    # ② music.play_url 存在时排在首位
+    item_play = {"music": {"play_url": {"url_list": ["https://x.com/a.mp3"]}},
+                 "video": {"play_addr": {"uri": "https://y.com/b.m4a"}}}
+    check("music.play_url 优先于 play_addr.uri",
+          douyin._audio_url_candidates(item_play, "") == ["https://x.com/a.mp3", "https://y.com/b.m4a"])
+
+    # ③ <audio> 标签 / 页面 .mp3 与 .m4a 直链作为兜底
+    check("能从 <audio> 标签取配乐",
+          douyin._audio_url_candidates(None, '<audio class="hide" src="https://sf11-cdn-tos.douyinstatic.com'
+                                            '/obj/ies-music/759.mp3" loop=""></audio>')
+          == ["https://sf11-cdn-tos.douyinstatic.com/obj/ies-music/759.mp3"])
+    check("域名含 music 的 .mp3 仍能命中",
+          "https://lf26-music-east.douyinstatic.com/obj/ies-music-hj/767.mp3"
+          in douyin._audio_url_candidates(None, '<audio src="https://lf26-music-east.douyinstatic.com'
+                                                '/obj/ies-music-hj/767.mp3"></audio>'))
+    check("图片链接不会被当成配乐候选",
+          douyin._audio_url_candidates(
+              None,
+              '<img src="https://p3.douyinpic.com/a.jpeg">'
+              '<img src="https://p1.douyinpic.com/b.webp">') == [])
+
+    # ④ uri 不是 http 直链时，用播放接口兜底换直链
+    fallback = douyin._audio_url_candidates({"video": {"play_addr": {"uri": "v0abc"}}}, "")
+    check("非 http 的 uri 走 playwm 兜底",
+          len(fallback) == 1 and "playwm" in fallback[0] and "video_id=v0abc" in fallback[0],
+          f"→ {fallback}")
+    check("候选去重", len(douyin._audio_url_candidates(
+        None, '<audio src="https://a.com/x.mp3"></audio><audio src="https://a.com/x.mp3"></audio>')) == 1)
+
+    section("配乐响应类型识别（无扩展名 m4a 也能落盘）")
+    check("audio/mpeg → .mp3",
+          _audio_ext_from_response("https://x/a", "audio/mpeg") == ".mp3")
+    check("audio/mp4 → .m4a",
+          _audio_ext_from_response("https://x/oIgHzeDaDoLQAif", "audio/mp4; charset=utf-8") == ".m4a")
+    check("无扩展名 + video/mp4 → 按 m4a 音频处理（实测同源配乐）",
+          _audio_ext_from_response("https://x/oIgHzeDaDoLQAif", "video/mp4") == ".m4a")
+    check("带 .mp3 后缀直接按音频",
+          _audio_ext_from_response("https://x/a.mp3", "") == ".mp3")
+    check("带 .m4a 后缀按音频",
+          _audio_ext_from_response("https://x/a.m4a", "") == ".m4a")
+    check("图片/HTML 响应不会被误判为音频",
+          _audio_ext_from_response("https://p3.douyinpic.com/a.jpeg", "image/jpeg") is None
+          and _audio_ext_from_response("https://x/a.html", "text/html") is None)
+
+    section("配乐多候选下载（端到端：探测 → 换源 → 校验）")
+    work_music = tmp / "music"
+    work_music.mkdir(parents=True, exist_ok=True)
+    if _sh.which("ffmpeg") and _sh.which("ffprobe"):
+        _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 "sine=frequency=440:duration=1", str(work_music / "src.mp3")], timeout=60)
+        audio_bytes = (work_music / "src.mp3").read_bytes()
+        calls: list[str] = []
+
+        def fake_fetch(url, timeout=90, limit=None):
+            calls.append(url)
+            if "img" in url:                       # 被误收进来的图片候选
+                return 200, b"not-audio", "image/jpeg"
+            if "dead" in url:                      # 第一个候选已失效
+                return 403, b"denied", ""
+            return (206, audio_bytes[:1], "audio/mpeg") if limit else (200, audio_bytes, "audio/mpeg")
+
+        log_music: list[str] = []
+        path, reason = download_douyin_music(
+            ["https://x/img.jpg", "https://x/dead.mp3", "https://x/ok.mp3"],
+            fake_fetch, work_music, log_music,
+        )
+        check("跳过非音频候选、换源后成功", path is not None and path.name == ".music.mp3",
+              f"→ {path} / {reason}")
+        check("用 range 探测（每候选先取 1 字节）",
+              len([c for c in calls if c.endswith("ok.mp3")]) == 2, f"→ {calls}")
+        check("下载后可解码校验通过", is_usable_audio(path))
+        check("日志记录了跳过与换源",
+              any("不是音频" in line for line in log_music)
+              and any("配乐已下载" in line for line in log_music), f"→ {log_music}")
+        check("临时配乐文件名带方括号不报错（含 . 前缀）", path.name.startswith(".music"))
+
+        def all_dead(url, timeout=90, limit=None):
+            return 403, b"", ""
+
+        dead_path, dead_reason = download_douyin_music(
+            ["https://x/dead1.mp3"], all_dead, work_music, []
+        )
+        check("全部候选失败时返回原因且不落盘",
+              dead_path is None and "403" in dead_reason, f"→ {dead_reason}")
+
+        no_path, no_reason = download_douyin_music([], fake_fetch, work_music, [])
+        check("没有候选时返回 None", no_path is None, f"→ {no_reason}")
+
+        def wrong_type(url, timeout=90, limit=None):
+            return 200, audio_bytes, "text/html"
+
+        bad_path, _ = download_douyin_music(["https://x/a"], wrong_type, work_music, [])
+        check("响应类型不是音频时不落盘", bad_path is None)
+
+        # 反向用例：地址像音频（.mp3）但内容其实是坏文件 → 必须靠 ffprobe 拦下并换源
+        calls2: list[str] = []
+
+        def bad_then_good(url, timeout=90, limit=None):
+            calls2.append(url)
+            if url.endswith("bad.mp3"):
+                return (206, b"\x00", "audio/mpeg") if limit else (200, b"\x00" * 4096, "audio/mpeg")
+            return (206, audio_bytes[:1], "audio/mpeg") if limit else (200, audio_bytes, "audio/mpeg")
+
+        recovered, _ = download_douyin_music(
+            ["https://x/bad.mp3", "https://x/good.mp3"], bad_then_good, work_music, []
+        )
+        check("坏文件（后缀像音频）被拦下并换下一个候选",
+              recovered is not None and len(calls2) == 4, f"→ {calls2}")
+    else:
+        print("     （缺 ffmpeg/ffprobe，跳过配乐下载端到端校验）")
 
     section("图文帖单文件下载")
     manager_dl = TaskManager(concurrency=1)

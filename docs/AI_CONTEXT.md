@@ -4,7 +4,7 @@
 > 「这是什么、现在到哪一步了、哪些坑已经踩过、下一步该怎么动」。
 >
 > 维护约定：**每次完成实质性工作后同步更新本文件**（尤其第 3、6、7 节）。
-> 最后更新：2026-10-11 · 对应提交 `dfb16c0`
+> 最后更新：2026-10-12 · 对应提交（阶段 11 修复图文帖配乐，待提交）
 
 ---
 
@@ -19,7 +19,7 @@
 | 访问地址 | http://127.0.0.1:8765 （只监听回环，无鉴权，单机自用） |
 | 架构 | 浏览器(Vue 3 SPA) → Python 标准库 HTTP 后端 → subprocess 调 yt-dlp/ffmpeg |
 | 技术栈 | 后端 Python 3.12（**仅标准库**）；前端 Vue 3 + Vite；引擎 yt-dlp + ffmpeg |
-| 测试 | **208 项**，`./run.sh --py tests/run_tests.py`（离线，秒级） |
+| 测试 | **238 项**，`./run.sh --py tests/run_tests.py`（离线，秒级） |
 | 代码量 | Python 4727 行 / 前端 3219 行 / 文档 2498 行 |
 | 数据库 | **无**（任务状态在内存，产物落 `downloads/`） |
 
@@ -37,7 +37,7 @@
 3. [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) —— 模块职责与数据流
 4. [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) —— **已踩过的坑**（含抖音通路原理）
 5. [`docs/DECISIONS.md`](DECISIONS.md) —— 为什么这么设计（14 项 ADR）
-6. [`docs/CHANGELOG.md`](CHANGELOG.md) —— 10 个阶段各做了什么
+6. [`docs/CHANGELOG.md`](CHANGELOG.md) —— 11 个阶段各做了什么
 
 ---
 
@@ -76,7 +76,8 @@
 | 多策略重试 + 退避 | ✅ | 4 级降级，失败可自愈 |
 | 字幕内嵌 | ⚠️ **仅代码链路验证** | 测试站点只有"弹幕"（私有 XML，ffmpeg 无法内嵌）→ 已优雅降级 |
 | **抖音视频**（免 Cookie，无水印 1080p） | ✅ | 真实下载，ffprobe 确认 |
-| **抖音图文帖 → 合成视频**（图片轮播 + 配乐） | ✅ | 26s / 1080×1920 / h264+aac / 音量 -12.7dB |
+| **抖音图文帖 → 合成视频**（图片轮播 + 配乐） | ✅ | **3 条真实链接**（单图×2 + 5 图×1）均 1080×1920 / h264+**aac**，音量 −12.7 / −14.3 / −14.1 dB，时长与配乐一致 |
+| **图文帖配乐获取**（多源候选 + 按响应类型探测） | ✅ | 修复"只有部分链接有声"；覆盖 `.mp3` 与**无扩展名 m4a** 两种配乐 |
 | 启动端口预检（友好报错） | ✅ | 单测覆盖 |
 | 前端界面（暗色霓虹 HUD） | ✅ | 无头 Chrome 截图验收 |
 
@@ -84,16 +85,18 @@
 
 | 事项 | 现状 | 需要的动作 |
 |---|---|---|
-| 抖音**多图**帖轮播时长分配 | 代码已实现，单测用合成图覆盖 | 需一条真实 9 图帖实测节奏是否合理 |
+| 抖音**多图**帖轮播时长分配 | 已用 5 图真实帖验证（按配乐时长均分） | 更多图（9 图）与"每张固定 N 秒"需求仍待用户确认 |
 | 抖音**实况动图**（`动图N.mp4`）分支 | 代码已实现（按数据结构 + 参考实现） | **无真实样本跑过**，需带实况的帖子验证 |
 | 字幕内嵌真实成功案例 | 只有降级路径被验证 | 找一个有正常字幕（SRT/ASS）的站点实测 |
 | 抖音合集 / 用户主页 / 直播 | ❌ 不支持 | 合集与主页**可能可行**（`sec_uid` 已能拿到）；直播不建议做 |
-| 多图帖配乐时长 vs 各图节奏 | 均分时长 | 抖音客户端实际节奏未知，用户可能要求固定每张 N 秒 |
+| 多图帖配乐时长 vs 各图节奏 | 均分时长（P2 未做） | 用户可能要求固定每张 N 秒，需其拍板 |
+| 图文帖**图片素材**下载健壮性 | 单链接单次（P1 未做） | `url_list` 有 3–4 条等价 CDN 链接但未轮换/补试，抖动网络下多图帖更易失败 |
 | 图片来源格式 | 优先 `.jpeg` 原图 | 部分帖子可能只有 `.webp`（代码已回退处理） |
 
 ### 仓库健康度
 
-- 工作区干净，本地与远程同步（`dfb16c0`）
+- 阶段 11 改动**尚未提交**（工作区含 `core/douyin.py`、`core/tasks.py`、测试与文档）
+- 远端最后同步提交为 `dfb16c0`（阶段 11 待推送）
 - `.gitignore` 已排除 `runtime/`（243MB）、`downloads/`、`node_modules/`
 - `static/` 构建产物**故意入库**（clone 后免 `npm install` 即可用）
 - **推前端改动后必须 `cd frontend && npm run build` 并提交** `static/` 变化
@@ -104,13 +107,13 @@
 
 | 文件 | 行数 | 职责 | 改动风险 |
 |---|---|---|---|
-| `core/douyin.py` | 828 | **抖音专用提取器**（视频 + 图文帖），含通路原理注释 | 高（依赖抖音接口，易变） |
-| `core/tasks.py` | 1216 | 任务状态机、下载编排、图集合成、收尾判定 | 高（核心逻辑） |
+| `core/douyin.py` | 987 | **抖音专用提取器**（视频 + 图文帖），含通路原理注释 | 高（依赖抖音接口，易变） |
+| `core/tasks.py` | 1340 | 任务状态机、下载编排、图集合成、收尾判定 | 高（核心逻辑） |
 | `core/ytdlp.py` | 912 | 引擎封装：命令构造、进度解析、重试策略、环境自适应 | 中 |
 | `core/server.py` | 418 | HTTP 路由 / SSE / 静态资源 / 路径越权防护 | 中 |
 | `app.py` | 164 | 入口：参数、端口预检、启动自检、优雅关闭 | 低 |
 | `core/config.py` | 63 | 路径/端口/并发（支持 `VH_*` 环境变量） | 低 |
-| `tests/run_tests.py` | 983 | 208 项自测（27 个分组） | —— |
+| `tests/run_tests.py` | 1134 | 238 项自测（28 个分组，含配乐回归 30 项） | —— |
 | `tools/verify_env.py` | 142 | 环境自查（含真实解析验证） | 低 |
 | `frontend/src/**` | 3219 | Vue 3 组件 + 自研 store + 设计令牌 | 中 |
 
@@ -122,16 +125,21 @@ core/douyin.py
   resolve_numeric_id()     短链→数字 id
   extract()                ★ 总入口（主路径 feed → 兜底分享页）
   _extract_via_feed()      主路径：App Feed 免签名接口（视频走这里，带 bit_rate）
+  extract_item()           ★ 分享页内联 JSON → videoInfoRes.item_list[0]（最可靠通道）
   parse_images_array()     图文帖：括号配平解析内联 images 数组
   rank_image_urls()        图文帖：jpeg 原图优先（排除带水印的 download_url_list）
+  _audio_url_candidates()  ★ 配乐多源候选链（play_url → play_addr.uri → <audio> → 正则 → playwm）
+  _music_duration_seconds() 配乐时长（优先取自 JSON）
   extract_gallery()        图文帖：构造 kind=gallery 结果
-  parse_music_duration()   配乐时长（决定合成视频长度）
+  parse_music_duration()   配乐时长的正则兜底
   play_url_for()           播放直链接口（play 无水印优先，playwm 兜底）
 
 core/tasks.py
   _run_inner()             ★ 单任务执行主流程
   _resolve_douyin_direct() 抖音：换成直链 / 或准备图集素材
   _download_douyin_gallery() ★ 图文帖：下载素材 + 合成视频
+  download_douyin_music()  ★ 配乐：候选逐个 range 探测 → 按 Content-Type 定扩展名 → 校验换源
+  _audio_ext_from_response() 响应类型 → .mp3/.m4a（无扩展名 OSS key 的关键）
   compose_slideshow_video()  ★ ffmpeg 合成（含音轨校验，见第 7 节坑 5）
   _finalize()              ★ 收尾：定位产物 + 判定「部分完成」
   _rename_to_title()       CDN 乱码文件名 → 按标题重命名
@@ -154,7 +162,7 @@ core/ytdlp.py
 ./run.sh --port 8899 --concurrency 4      # 换端口 / 改并发
 
 # 测试
-./run.sh --py tests/run_tests.py          # 208 项离线自测（改动后必跑）
+./run.sh --py tests/run_tests.py          # 238 项离线自测（改动后必跑）
 ./run.sh --py tests/run_tests.py --live   # 追加真实解析 + 真实下载
 ./run.sh --py tools/verify_env.py --url "<链接>" --proxy 127.0.0.1:7897 --browser chrome
 
@@ -201,6 +209,10 @@ cd frontend && npm run build    # 产物输出到 ../static
 | 7 | 图文帖**没有视频流** | 帖子级 `video` 只有封面（`bit_rate` 为空）；那个 `play_addr` 其实是配乐 mp3 |
 | 8 | 图文帖要**本地合成视频** | ffmpeg 图片轮播 + 配乐；时长取 `music.duration` |
 | 9 | 网络抖动常见 | `http.client.IncompleteRead` 必须收敛为可重试错误（已加 3 次重试） |
+| 10 | **配乐不能只靠一条正则去页面里搜** | 旧正则要求「域名含 `music` + `.mp3` 结尾」→ 只有域名恰好含 music 的帖子有声。配乐域名在 `lf26`/`sf9`/`sf11`/`sf6` 间漂移，且可能是**无扩展名 OSS key**（`audio/mp4`）。→ 改走内联 JSON + 多候选 + 按 `Content-Type` 探测（见下条） |
+| 11 | 配乐**稳定来源**是 `item.video.play_addr.uri` | `music.play_url` 在实测三条帖子里**全是空**；图文帖的"播放地址"就是配乐。解析入口 `extract_item()` |
+| 12 | 配乐**按响应类型定扩展名** | `audio/mpeg → .mp3`；`audio/mp4` 或无扩展名 + `video/mp4 → .m4a`。只看 URL 后缀会把无扩展名 m4a 当成非音频丢掉（这就是 `GUNTbne404o` 无声的原因） |
+| 13 | 单个配乐候选可能失效 | 403 / 类型不对 / 文件损坏都要**自动换下一个候选**，全部失败才报错并让用户感知 |
 
 ### 6.3 判定正确性（曾误报成功，危害最大）
 
@@ -290,7 +302,7 @@ git config --global --unset url.https://ghproxy.com/https://github.com/.insteado
 | [`docs/DEVELOPMENT.md`](DEVELOPMENT.md) | 开发者 | 目录结构、改动指引、测试说明、调试技巧 |
 | [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | 用户 / 开发者 | 站点限制、报错对照表、FAQ、**抖音通路原理** |
 | [`docs/DECISIONS.md`](DECISIONS.md) | 开发者 | 14 项 ADR（背景/决策/理由/代价）+ 未采纳方案 |
-| [`docs/CHANGELOG.md`](CHANGELOG.md) | 开发者 | 10 个阶段的迭代与全部已修问题 |
+| [`docs/CHANGELOG.md`](CHANGELOG.md) | 开发者 | 11 个阶段的迭代与全部已修问题 |
 | [`design-system/README.md`](../design-system/README.md) | 前端 | 真实设计令牌（MASTER.md 是自动生成快照，**不代表实现**） |
 
 ---
@@ -298,11 +310,19 @@ git config --global --unset url.https://ghproxy.com/https://github.com/.insteado
 ## 10. 下一步建议（按优先级）
 
 1. **补真实验证**（最高优先，都是"代码已写但没真样本"）：
-   - 让用户提供：一条**多图图文帖**、一条**带实况动图**的帖子、一条**有正常字幕**的视频
-   - 用 `--live` 或真实下载验证，并把结论写进本文档第 3 节
-2. **图文帖节奏优化**（等用户反馈）：目前按配乐时长均分，可能要改成固定每张 N 秒
-3. **抖音合集 / 用户主页**（可行性中等）：`sec_uid` 已能从分享页拿到，
+   - 已补：**5 图真实图文帖**（`0JWrSFgCzV0`）节奏验证通过
+   - 仍缺：一条**带实况动图**的帖子、一条**有正常字幕**的视频
+2. **P1 · 图文帖图片素材下载健壮性**（用户已确认后续再做）：
+   目前每张图只试 `url_list[0]` 一次，其余 3–4 条等价 CDN 链接未轮换/补试；
+   抖动网络下多图帖更容易出现"第 N 张失败"→ 标「部分完成」
+3. **P2 · 图文帖节奏优化**（等用户拍板）：目前按配乐时长均分，可能要改成固定每张 N 秒
+4. **抖音合集 / 用户主页**（可行性中等）：`sec_uid` 已能从分享页拿到，
    需要找到免签名的作品列表接口（App 端 `aweme/post/` 返回空，需继续试参数）
-4. **字幕内嵌**：确认普通字幕（SRT/ASS）能否成功内嵌，补真实案例
-5. **长期维护**：抖音通路依赖"新旧 API 并存"窗口期，需定期回归；
-   若失效，参考 `docs/TROUBLESHOOTING.md` 的探测方法重新找通路
+5. **字幕内嵌**：确认普通字幕（SRT/ASS）能否成功内嵌，补真实案例
+6. **长期维护**：抖音通路依赖"新旧 API 并存"窗口期，需定期回归；
+   若失效，参考 `docs/TROUBLESHOOTING.md` 的探测方法重新找通路。
+   特别注意：**配乐相关字段（`play_addr.uri` 的语义、`music.play_url` 是否回归）
+   是最易变的部分**，改动前先按第 6.2 节第 10–13 条做真实链接实测
+
+> 阶段 11 的修复（配乐多源候选 + 按响应类型探测）**尚未提交/推送**，
+> 接手时先 `git status` / `git log -1` 确认。

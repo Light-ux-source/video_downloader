@@ -66,6 +66,35 @@ def fetch_to_file(task: "Task", fetch, url, target: Path, index: int) -> bool:
     return True
 
 
+_AUDIO_EXT_BY_TYPE = (
+    ("audio/mpeg", ".mp3"),
+    ("audio/mp3", ".mp3"),
+    ("audio/mp4", ".m4a"),
+    ("audio/x-m4a", ".m4a"),
+    ("audio/aac", ".aac"),
+    ("audio/", ".mp3"),
+)
+
+
+def _audio_ext_from_response(url: str, content_type: str) -> str | None:
+    """判断响应是不是音频，并给出应使用的扩展名；不是音频返回 None。
+
+    必须按**响应类型**判断而不是 URL 后缀：抖音图文帖的配乐有时是无扩展名的
+    OSS key（`Content-Type: audio/mp4`），只看后缀会把它误判成非音频而丢弃。
+    """
+    base = (url or "").split("?")[0].lower()
+    if base.endswith((".mp3", ".m4a", ".aac")):
+        return ".m4a" if base.endswith(".m4a") else base[base.rfind(".") :]
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype == "video/mp4" and not base.endswith(".mp4"):
+        # 无扩展名却回 video/mp4 的，是容器为 mp4 的纯音频（实测同源配乐）
+        return ".m4a"
+    for prefix, ext in _AUDIO_EXT_BY_TYPE:
+        if ctype.startswith(prefix):
+            return ext
+    return None
+
+
 def _probe_streams(path: Path) -> list[str]:
     """返回媒体文件里的流类型列表（如 ['video', 'audio']）；失败返回空列表。"""
     import shutil
@@ -85,6 +114,79 @@ def _probe_streams(path: Path) -> list[str]:
     if result.returncode != 0:
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def is_usable_audio(path: Path | None) -> bool:
+    """配乐是否真的可解码（用于"下完再校验"）。"""
+    return bool(path) and Path(path).exists() and "audio" in _probe_streams(Path(path))
+
+
+def download_douyin_music(
+    candidates: list[str],
+    fetch,
+    folder: Path,
+    log: list[str],
+) -> tuple[Path | None, str]:
+    """逐个探测配乐候选并落盘，返回 (配乐路径, 失败原因)。
+
+    图文帖配乐的来源在不同帖子里并不一致（`music.play_url` 常为空，
+    真正的地址在 `video.play_addr.uri`；域名与扩展名都会漂移），因此候选是**多个**：
+
+      * 用 range 只取 1 字节做探测：配乐通常 <1MB，先探后下可避免白下大文件；
+        探测失败（不支持 range / 403）时退回完整下载
+      * 按**响应类型**决定扩展名（.mp3 / .m4a），无扩展名的 OSS key 也能正确落盘
+      * 落盘后必须能被 ffprobe 解出 audio 流，否则换下一个候选——
+        宁可多试一条，也不能合出无声视频
+    """
+    last_error = ""
+    usable = [u for u in candidates if u]
+    for index, url in enumerate(usable, 1):
+        tag = f"候选 {index}" if len(usable) > 1 else "配乐"
+        try:
+            status, data, content_type = fetch(url, limit=1)
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.append(f"# 配乐{tag}探测失败（{last_error[:120]}）")
+            continue
+        if status not in (200, 206):
+            last_error = f"HTTP {status}"
+            log.append(f"# 配乐{tag}探测失败：{last_error}")
+            continue
+        ext = _audio_ext_from_response(url, content_type)
+        if not ext:
+            last_error = f"不是音频（Content-Type: {content_type or '未知'}）"
+            log.append(f"# 配乐{tag}被跳过：{last_error}")
+            continue
+        if status == 206 or len(data) < 1024:
+            # 探测响应只含 1 字节：按同一地址取完整内容
+            try:
+                status, data, content_type = fetch(url)
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{type(exc).__name__}: {exc}"
+                log.append(f"# 配乐{tag}下载失败：{last_error[:120]}")
+                continue
+            if status not in (200, 206) or not data:
+                last_error = f"HTTP {status}（响应为空）"
+                log.append(f"# 配乐{tag}下载失败：{last_error}")
+                continue
+        target = folder / f".music{ext}"
+        try:
+            target.write_bytes(data)
+        except OSError as exc:
+            last_error = f"写入失败：{exc}"
+            log.append(f"# 配乐{tag}保存失败：{last_error}")
+            continue
+        if not is_usable_audio(target):
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            last_error = "文件无法解码（可能不是音频）"
+            log.append(f"# 配乐{tag}不可解码，换下一个候选")
+            continue
+        log.append(f"# 配乐已下载：{len(data) / 1024:.1f}KB（{ext.lstrip('.')}）")
+        return target, ""
+    return None, last_error
 
 
 def compose_slideshow_video(
@@ -767,13 +869,15 @@ class TaskManager:
                 "_douyin_images": info["images"],
                 "_douyin_headers": info.get("direct_headers") or {},
                 "_douyin_music": info.get("music_url"),
+                "_douyin_music_candidates": info.get("music_candidates") or [],
                 "_douyin_duration": info.get("video_duration"),
             }
             task.playlist_total = len(info["images"]) + (0 if animated == len(info["images"]) else 1)
             task.log.append(
                 f"# 抖音图文帖：共 {len(info['images'])} 张原图"
                 + (f"（含 {animated} 张实况动图）" if animated else "")
-                + f"，配乐时长 {info.get('music_duration') or '未知'}s，将本地合成为视频"
+                + f"，配乐 {len(info.get('music_candidates') or [])} 个候选"
+                f"（时长 {info.get('music_duration') or '未知'}s），将本地合成为视频"
             )
             self._emit(task)
             return
@@ -849,6 +953,7 @@ class TaskManager:
         产物统一放在 `downloads/{标题}/` 下，与其他任务的收尾校验共用同一套逻辑。
         """
         import http.cookiejar
+        import urllib.error
         import urllib.request
 
         from . import douyin
@@ -856,6 +961,10 @@ class TaskManager:
         images: list[dict[str, Any]] = list(task.options.get("_douyin_images") or [])
         headers = dict(task.options.get("_douyin_headers") or {})
         music_url = task.options.get("_douyin_music")
+        # 配乐候选可能有多条（新增字段）；旧任务/旧调用只有单条 music_url 时也能工作
+        music_candidates = [
+            u for u in (task.options.get("_douyin_music_candidates") or []) if u
+        ] or ([music_url] if music_url else [])
         duration = float(task.options.get("_douyin_duration") or 0) or max(len(images), 1) * 5.0
 
         folder = download_dir / _safe_folder_name(task.title or task.url)
@@ -875,9 +984,27 @@ class TaskManager:
         opener = douyin._build_opener(proxy, http.cookiejar.CookieJar())
 
         def fetch(url: str, timeout: int = 90) -> bytes:
+            """取回完整内容（图片/动图用）。"""
             request = urllib.request.Request(url, headers=headers)
             with opener.open(request, timeout=timeout) as response:
                 return response.read()
+
+        def fetch_probe(url: str, timeout: int = 90,
+                        limit: int | None = None) -> tuple[int, bytes, str]:
+            """带状态码与 Content-Type 的取回；limit 用于只取少量字节做探测。
+
+            配乐的 CDN 域名与扩展名都会漂移，必须看响应头才能判断"这是不是音频"。
+            """
+            request = urllib.request.Request(url, headers=headers)
+            if limit:
+                request.add_header("Range", f"bytes=0-{max(limit - 1, 0)}")
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    # 只读 1 字节：Content-Length 可能是完整长度，read() 会白下整个文件
+                    data = response.read(limit) if limit else response.read()
+                    return response.status, data, response.headers.get("Content-Type", "")
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read() if exc.fp else b"", ""
 
         task.phase = PHASE_DOWNLOADING
         all_animated = bool(images) and all(i.get("animated_url") for i in images)
@@ -921,22 +1048,20 @@ class TaskManager:
 
             music_path = None
             music_failed_reason = ""
-            if music_url:
-                music_path = folder / ".music.mp3"
-                try:
-                    data = fetch(music_url, timeout=120)
-                    if not data:
-                        raise ValueError("响应为空")
-                    music_path.write_bytes(data)
-                    task.log.append(f"# 配乐已下载：{len(data) / 1024:.1f}KB")
-                except Exception as exc:  # noqa: BLE001
+            if music_candidates:
+                # 多个候选逐个探测：只要有一条是真音频就成功（见 download_douyin_music）
+                music_path, music_failed_reason = download_douyin_music(
+                    music_candidates, fetch_probe, folder, task.log
+                )
+                if music_path is None:
                     # 配乐拿不到会导致视频无声——必须让用户知道，不能静默降级
-                    music_failed_reason = str(exc)[:160]
-                    task.log.append(f"# ⚠ 配乐下载失败，视频将没有声音：{music_failed_reason}")
+                    reason = music_failed_reason or "所有候选地址都不可用"
+                    task.log.append(f"# ⚠ 配乐下载失败，视频将没有声音：{reason}")
                     task.warnings += 1
-                    music_path = None
+                    task.last_warning = f"配乐失败：{reason}"
             else:
                 music_failed_reason = "该帖子未提供配乐"
+                # 这是客观情况而非异常，只留日志；不累加 warnings（前端把 warnings 显示为"重试"）
                 task.log.append("# ⚠ 未获取到配乐直链，视频将没有声音")
 
             video_path = folder / f"{_safe_folder_name(task.title or task.url)}.mp4"

@@ -46,6 +46,14 @@ yt-dlp 的抖音提取器走 `www.douyin.com/aweme/v1/web/aweme/detail/` 这类 
 - 直播与直播回放走 live 接口，不适用。
 - 若抖音给 App 端接口也加签名校验，主路径失效时会自动降级到兜底路径；
   两条都失败才报错。
+
+图文帖配乐（踩过的坑）
+----------------------
+图文帖的配乐**不能只靠一条正则**去页面里搜 `...music...mp3`：
+实测配乐 CDN 域名会在 `lf26-music-east` / `sf11-cdn-tos` / `sf6-cdn-tos` 之间漂移，
+且同一个帖子既可能是 `.mp3`，也可能是**无扩展名的 OSS key**（`Content-Type: audio/mp4`）。
+唯一稳定的来源是作品对象里的 `video.play_addr.uri`——图文帖的“播放地址”就是配乐，
+`music.play_url` 反而经常是空的。因此这里改为「解析内联 JSON + 多候选 + 按响应类型探测」。
 """
 from __future__ import annotations
 
@@ -127,8 +135,15 @@ VIDEO_URI_RE = re.compile(r'"play_addr":\{"uri":"(v0[0-9a-zA-Z]+)"')
 DESC_RE = re.compile(r'"desc":"(.*?)","create_time"')
 AUTHOR_RE = re.compile(r'"nickname":"(.*?)"')
 LIKES_RE = re.compile(r'"digg_count":(\d+)')
-# 配乐直链（实测形如 https://lf26-music-east.douyinstatic.com/obj/ies-music-hj/<id>.mp3）
-MUSIC_URL_RE = re.compile(r'https://[a-z0-9-]*music[a-z0-9-]*\.douyinstatic\.com/[^"\s\\]+\.mp3')
+# 配乐直链兜底：**不能要求域名里含 music、也不能只认 .mp3**——
+# 实测配乐 CDN 域名会在 `lf26-music-east` / `sf11-cdn-tos` / `sf6-cdn-tos` 之间漂移，
+# 且部分帖子的配乐是**无扩展名的 OSS key**（Content-Type: audio/mp4）。旧正则把
+# 域名与扩展名都写死，导致除“域名恰好含 music 且以 .mp3 结尾”的帖子外全都拿不到配乐。
+MUSIC_URL_RE = re.compile(
+    r"https://[a-z0-9-]+\.douyinstatic\.com/[^\"\s\\]+?\.(?:mp3|m4a|aac)(?:\?[^\"\s\\]*)?"
+)
+# 分享页渲染的 <audio> 标签（配乐兜底来源之一）
+AUDIO_TAG_RE = re.compile(r"<audio[^>]+src=[\"']([^\"']+)[\"']", re.IGNORECASE)
 
 
 class DouyinError(RuntimeError):
@@ -563,6 +578,42 @@ def parse_images_array(html: str) -> list[dict[str, Any]] | None:
     return parsed if isinstance(parsed, list) else None
 
 
+def extract_item(html: str) -> dict[str, Any] | None:
+    """解析分享页内联的 `videoInfoRes.item_list[0]`（作品完整对象）。
+
+    这是比正则更可靠的通道：短视频与图文帖的标题/作者/统计/配乐/图片都在里面。
+    三条真实页面实测均可解析；失败（结构变化/被风控）返回 None，
+    由调用方降级到正则路径，保证不会因此整个解析失败。
+    """
+    anchor = html.find('"videoInfoRes"')
+    if anchor < 0:
+        return None
+    list_pos = html.find('"item_list":[', anchor)
+    if list_pos < 0:
+        return None
+    begin = html.index("[", list_pos)
+    depth = 0
+    end = None
+    for idx in range(begin, len(html)):
+        char = html[idx]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    if end is None:
+        return None
+    try:
+        items = json.loads(html[begin:end].replace("\\u002F", "/"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None
+    return items[0]
+
+
 def rank_image_urls(url_list: list[str] | None) -> list[str]:
     """给图片候选链接排序。
 
@@ -619,6 +670,94 @@ def parse_music_duration(html: str) -> float | None:
     return value / 1000 if value > 10000 else float(value)
 
 
+def _item_str(item: dict[str, Any] | None, key: str) -> str:
+    if not isinstance(item, dict):
+        return ""
+    value = item.get(key)
+    return str(value).strip() if value else ""
+
+
+def _item_author(item: dict[str, Any] | None) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    author = item.get("author") or {}
+    name = author.get("nickname") if isinstance(author, dict) else None
+    return str(name).strip() if name else None
+
+
+def _item_like_count(item: dict[str, Any] | None) -> int | None:
+    if not isinstance(item, dict):
+        return None
+    value = (item.get("statistics") or {}).get("digg_count")
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def _music_duration_seconds(item: dict[str, Any] | None) -> float | None:
+    """从作品对象里取配乐时长。抖音通常给秒，极小概率给毫秒。"""
+    if not isinstance(item, dict):
+        return None
+    value = (item.get("music") or {}).get("duration")
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return value / 1000 if value > 10000 else float(value)
+
+
+def _dedupe(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            result.append(url)
+    return result
+
+
+def _audio_url_candidates(item: dict[str, Any] | None, html: str) -> list[str]:
+    """收集配乐候选直链，按实测可靠性排序（调用方逐个探测）。
+
+    图文帖的音乐有三个已知来源，**不同帖子只会命中其中一部分**，因此必须全试：
+
+     1. `music.play_url.url_list` —— 最规范的字段，但实测多条帖子该字段为空
+     2. `video.play_addr.uri` —— 图文帖的“播放地址”其实就是配乐
+        （实测形如 `.../ies-music-hj/<id>.mp3`，或是**无扩展名的 OSS key**，
+        后者 `Content-Type: audio/mp4`，必须靠响应类型判断而不是后缀）
+     3. 分享页渲染的 `<audio src=...>` 与页面里的 .mp3 直链 —— 兜底
+     4. `playwm?video_id=<uri>` —— 当 uri 不是 http 直链时用它换一条 CDN 链接
+
+    只做“候选收集+去重+排序”，不做网络请求：探测（Content-Type / 可解码性）
+    由调用方在带代理与游客 cookie 的 opener 上完成。
+    """
+    candidates: list[str] = []
+    uri = ""
+    if isinstance(item, dict):
+        play_url = (item.get("music") or {}).get("play_url") or {}
+        if isinstance(play_url, dict):
+            candidates += [u for u in (play_url.get("url_list") or []) if u]
+        uri = str(((item.get("video") or {}).get("play_addr") or {}).get("uri") or "")
+
+    if uri.startswith("http"):
+        candidates.append(uri)
+
+    candidates += [u for u in AUDIO_TAG_RE.findall(html) if u]
+    candidates += [m.group(0).replace("\\u002F", "/") for m in MUSIC_URL_RE.finditer(html)]
+
+    if uri and not uri.startswith("http"):
+        # 非 http 的 uri 是 CDN 对象 key，只能通过播放接口换直链
+        candidates.append(
+            PLAYWM_API_TEMPLATE.format(video_id=uri, ratio="720p")
+        )
+    elif not uri and isinstance(item, dict):
+        # 没有 uri 时用音乐 id 拼一把（末位兜底，可能 404，探测时会被淘汰）
+        mid = str((item.get("music") or {}).get("mid") or "")
+        if mid.isdigit():
+            candidates.append(
+                f"{PLAYWM_API_TEMPLATE.format(video_id=mid, ratio='720p')}"
+            )
+    return _dedupe(candidates)
+
+
 def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
     """把分享页里的 images 数组转成归一化的图集结果。
 
@@ -628,15 +767,30 @@ def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
     if not images:
         return None
 
-    desc = DESC_RE.search(html)
-    title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
-    author = AUTHOR_RE.search(html)
-    likes = LIKES_RE.search(html)
+    # 优先用内联 JSON（字段最全、最可靠）；解析不了再退回正则
+    item = extract_item(html)
+    title = _item_str(item, "desc") if item else None
+    if not title:
+        desc = DESC_RE.search(html)
+        title = desc.group(1).strip() if desc else ""
+    title = title or f"douyin_{numeric_id}"
 
-    # 配乐：图文帖本身没有视频流，但带背景音乐，用于本地合成视频
-    music_match = MUSIC_URL_RE.search(html)
-    music_url = music_match.group(0).replace("\\u002F", "/") if music_match else None
-    music_duration = parse_music_duration(html)
+    author_name = _item_author(item)
+    if not author_name:
+        author = AUTHOR_RE.search(html)
+        author_name = author.group(1).strip() if author else None
+
+    like_count = _item_like_count(item)
+    if like_count is None:
+        likes = LIKES_RE.search(html)
+        like_count = int(likes.group(1)) if likes else None
+
+    # 配乐：图文帖本身没有视频流，但带背景音乐，用于本地合成视频。
+    # 候选可能有多个（有时是 .mp3，有时是无扩展名的 m4a），逐个探测由调用方完成。
+    candidates = _audio_url_candidates(item, html)
+    music_duration = _music_duration_seconds(item)
+    if music_duration is None:
+        music_duration = parse_music_duration(html)
 
     items: list[dict[str, Any]] = []
     formats: list[dict[str, Any]] = []
@@ -687,14 +841,14 @@ def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
         "url": f"https://www.douyin.com/note/{numeric_id}",
         "id": numeric_id,
         "title": title,
-        "uploader": author.group(1).strip() if author else None,
+        "uploader": author_name,
         "extractor": "Douyin (VideoHarbor 直连)",
         "duration": None,
         "duration_text": None,
         "thumbnail": items[0]["url"],
         "description": "",
         "view_count": None,
-        "like_count": int(likes.group(1)) if likes else None,
+        "like_count": like_count,
         "upload_date": None,
         "is_live": False,
         "has_subtitles": False,
@@ -705,7 +859,9 @@ def extract_gallery(html: str, numeric_id: str) -> dict[str, Any] | None:
         "animated_count": sum(1 for i in items if i.get("animated_url")),
         # 下载所需的全部信息（tasks 会据此本地合成视频）
         "images": items,
-        "music_url": music_url,
+        # 配乐可能有多个候选（字段来源不同、CDN 域名漂移），由 tasks 逐个探测后择优
+        "music_candidates": candidates,
+        "music_url": candidates[0] if candidates else None,
         "music_duration": music_duration,
         # 幻灯片视频总时长：优先用配乐时长（与抖音客户端播放效果一致），
         # 没有配乐时按每张图 5 秒估算
@@ -731,8 +887,11 @@ def _extract_via_share(
 
     video_id = extract_video_id(html)
 
-    desc = DESC_RE.search(html)
-    title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
+    item = extract_item(html)
+    title = _item_str(item, "desc") if item else ""
+    if not title:
+        desc = DESC_RE.search(html)
+        title = desc.group(1).strip() if desc else f"douyin_{numeric_id}"
 
     ratio = ratio_for_preset(preset)
     direct_url = play_url_for(opener, video_id, ratio)

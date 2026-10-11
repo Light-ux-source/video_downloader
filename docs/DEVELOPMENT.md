@@ -48,7 +48,7 @@ video_downloader/
 │  ├─ vite.config.js           # 产物输出到 ../static
 │  └─ .npmrc                   # 镜像源
 ├─ tools/verify_env.py         # 环境自查工具
-├─ tests/run_tests.py          # 后端自测（208 项 / 27 分组）
+├─ tests/run_tests.py          # 后端自测（238 项 / 28 分组）
 ├─ static/                     # 前端构建产物（入库，clone 后免构建）
 ├─ docs/                       # 文档（AI_CONTEXT 为 AI 接手入口）
 ├─ run.sh                      # 启动器 / 运行时包装器
@@ -79,7 +79,7 @@ PY
 ## 4. 测试
 
 ```bash
-./run.sh --py tests/run_tests.py          # 离线：208 项，秒级
+./run.sh --py tests/run_tests.py          # 离线：238 项，秒级
 ./run.sh --py tests/run_tests.py --live   # 额外真实解析 + 真实下载（依赖外网）
 ```
 

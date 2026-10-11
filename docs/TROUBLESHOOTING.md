@@ -100,13 +100,51 @@ GET https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<数字id>
 | 原图怎么选 | `images[].url_list` 里的 **`.jpeg`** —— 实测 199.8KB、1000×1573、**无水印** |
 | 不要用哪个 | `download_url_list` 的模板名带 `-water`，实测**带水印**（129.4KB webp），已明确排除 |
 | **输出什么** | **视频**：图文帖本身没有视频流，但客户端播放的是「图片轮播 + 配乐」，因此本地用 ffmpeg 合成 `{标题}.mp4` |
-| 配乐从哪来 | 分享页 `music` 对象里的 `.mp3` 直链；`music.duration` 就是客户端播放时长，用作合成视频总时长 |
+| 配乐从哪来 | **主来源是作品对象里的 `video.play_addr.uri`**（图文帖的"播放地址"就是配乐）；`music.play_url` 经常为空，只能作候选之一。见下节「配乐为什么难取」 |
+| 配乐时长 | 取内联 JSON 里 `music.duration`（客户端播放时长），用作合成视频总时长；JSON 解析失败时回退正则 |
 | 存放方式 | `downloads/{标题}/{标题}.mp4` + 保留原图 `图片N.jpeg` |
 | 实况照片 | `images[].video.play_addr.url_list` 存在即为动图（抖音的动图就是 mp4），另存为 `动图N.mp4`；若全部是动图则跳过合成 |
 
 > 注意：App Feed 接口对图文帖**不返回目标数据**（只回推荐流），因此不能因为
 > "Feed 里没命中"就判定作品不可用——必须降级到分享页路径再判断。
 > 这个坑已写进代码注释与单元测试。
+
+#### 图文帖配乐为什么难取（踩过的坑，改动前必读）
+
+**症状**：同一批图文帖里，只有**部分**链接下载出的视频有声音，其余无声，
+且看起来毫无规律（例如 `v.douyin.com/G6M5xytCkMM/` 正常，
+`v.douyin.com/GUNTbne404o/`、`v.douyin.com/0JWrSFgCzV0/` 无声）。
+
+**根因**：配乐地址**不能靠"域名/后缀"去页面里猜**，而旧实现正是这么做的——
+用一条要求「域名含 `music` 且以 `.mp3` 结尾」的正则搜索页面。实测三条帖子：
+
+| 帖子 | 配乐实际地址 | 旧正则 |
+|---|---|---|
+| `G6M5xytCkMM` | `lf26-music-east.douyinstatic.com/obj/ies-music-hj/….mp3` | ✓ 命中 |
+| `0JWrSFgCzV0` | `sf6-cdn-tos.douyinstatic.com/obj/ies-music/….mp3`（**域名不含 music**） | ✗ 漏掉 |
+| `GUNTbne404o` | `sf6-cdn-tos.douyinstatic.com/obj/tos-cn-ve-2774/oIgHze…`（**无扩展名，`Content-Type: audio/mp4`**） | ✗ 漏掉 |
+
+另外 `music.play_url` 在这些帖子里**都是空的**，配乐真正的出处是
+`videoInfoRes.item_list[0].video.play_addr.uri`——图文帖的"播放地址"就是配乐。
+
+**现在的做法**（阶段 11 修复）：解析内联 JSON → 收集多个候选
+（`music.play_url` → `video.play_addr.uri` → `<audio src>` → 放宽的扩展名正则 → 播放接口兜底）
+→ 每个候选先用 `Range` 取 1 字节**按 `Content-Type` 判断是不是音频** → 落盘前用 `ffprobe`
+确认可解码 → 不行就换下一个候选。因此：
+
+- **配乐是 `.mp3` 还是无扩展名的 `.m4a` 都能正确落盘**（按响应类型决定扩展名）
+- **单个候选失效（403/类型不对/损坏）会自动换源**，不会静默变成无声视频
+- 日志会写明实际使用的格式，例如 `# 配乐已下载：261.1KB（m4a）`
+
+排查时先看这两行日志：
+
+```
+# 抖音图文帖：共 5 张原图，配乐 1 个候选（时长 29.0s），将本地合成为视频
+# 配乐已下载：465.8KB（mp3）
+```
+
+- **`配乐 0 个候选`** → 说明帖子页面结构变了，配乐字段没解析到（需要更新解析逻辑）
+- **`⚠ 配乐下载失败，视频将没有声音：…`** → 候选都被探测淘汰，原因写在后面
 
 #### 图文帖合成视频没有声音？
 
@@ -158,9 +196,14 @@ ffmpeg -hide_banner -i "downloads/<标题>/<标题>.mp4" -af volumedetect -f nul
 #### 实现位置与自测
 
 - 代码：`core/douyin.py`（主路径 + 兜底路径，含原理与边界注释）
+  其中图文帖配乐相关：`extract_item()`（解析内联 JSON）、`_audio_url_candidates()`（多源候选）、
+  `_music_duration_seconds()`；
+  下载侧：`core/tasks.py::download_douyin_music()`（候选探测/换源/可解码校验）、
+  `_audio_ext_from_response()`（按 `Content-Type` 定扩展名）
 - 接入点：`core/ytdlp.py::probe()`（解析）、`core/tasks.py::_resolve_douyin_direct()`（下载）
 - 自测：`tests/run_tests.py::test_douyin`（URL 识别、档位选择、不可用原因分类、
-  网络异常收敛与重试、文件名规范化）
+  网络异常收敛与重试、文件名规范化、**内联 JSON 解析、配乐候选链、响应类型识别、
+  多候选下载与换源**）
 
 ---
 
@@ -369,7 +412,7 @@ git config --global http.proxy http://127.0.0.1:7897
 ### 7. 运行自测
 
 ```bash
-./run.sh --py tests/run_tests.py          # 离线，208 项（27 个分组）
+./run.sh --py tests/run_tests.py          # 离线，238 项（28 个分组）
 ./run.sh --py tests/run_tests.py --live   # 额外做真实解析与下载
 ```
 

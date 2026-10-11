@@ -45,7 +45,7 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 | **字幕** | 下载并内嵌字幕（可选自动生成字幕、指定语言） |
 | **高级参数** | Cookies 文件 / 从浏览器读 Cookies / 代理 / 限速 / 并发分片 / 自定义格式表达式 |
 | **抖音免 Cookie** | 内置专用通道：**无需登录、无需提供 Cookie**，视频拿**无水印**原画（最高 1080p） |
-| **抖音图文帖** | 保存为**视频**：图片轮播 + 原配乐用 ffmpeg 本地合成 `标题.mp4`；实况动图另存为 `动图N.mp4`；同时保留无水印原图 |
+| **抖音图文帖** | 保存为**视频**：图片轮播 + 原配乐用 ffmpeg 本地合成 `标题.mp4`；配乐**多来源自动择优**（`.mp3` 或无扩展名 m4a 都能识别），不会静默变无声；实况动图另存为 `动图N.mp4`；同时保留无水印原图 |
 
 ### 自动容错
 
@@ -104,7 +104,7 @@ git clone https://github.com/Light-ux-source/video_downloader.git video_download
 
 ## 项目状态
 
-- 后端自测：**208 项全部通过**（27 个分组，`./run.sh --py tests/run_tests.py`）
+- 后端自测：**238 项全部通过**（28 个分组，`./run.sh --py tests/run_tests.py`）
 - 真实站点验证：
   - **B 站**：视频（360P–1080P）/ 音频 MP3 / 播放列表均实测通过，`ffprobe` 校验产物
   - **YouTube**：解析 80 个画质、真实下载通过（需 node + 代理）

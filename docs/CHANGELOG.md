@@ -4,6 +4,82 @@
 
 ---
 
+## 阶段 11：修复图文帖配乐丢失（多源候选 + 按响应类型探测）
+
+**背景**：用户多轮实测后给出反例——三条约同一形态的抖音图文帖链接里，
+`v.douyin.com/G6M5xytCkMM/` 能正常保存出带配乐的视频，而
+`v.douyin.com/GUNTbne404o/`、`v.douyin.com/0JWrSFgCzV0/` 保存下来**没有声音**。
+
+### 根因（实测定位，不是推测）
+
+抓取三条真实分享页 + 逐条 `curl`/`ffprobe` 对比后确认：
+
+| 事实 | 证据 |
+|---|---|
+| 图文帖配乐地址**稳定存在于 `videoInfoRes.item_list[0].video.play_addr.uri`** | 三条帖子该字段分别指向 `ies-music-hj/….mp3`、`obj/tos-cn-ve-2774/…`（无扩展名）、`ies-music/….mp3`；逐个 `GET` 得到 `audio/mpeg 416KB` / `audio/mp4 261KB` / `audio/mpeg 466KB`，`ffprobe` 均可解码 |
+| `music.play_url` **经常是空的** | 三条帖子的 `music` 对象都只有 `mid/title/author/duration/cover_*` |
+| 旧代码取配乐只靠一条正则 `MUSIC_URL_RE` | `r'https://[a-z0-9-]*music[a-z0-9-]*\.douyinstatic\.com/[^"\s\\]+\.mp3'` —— 要求**域名含 `music`** 且**以 `.mp3` 结尾** |
+
+于是命中率完全取决于配乐 CDN 的随机性：
+
+| 链接 | 配乐地址 | 旧正则 | 结果 |
+|---|---|---|---|
+| `G6M5xytCkMM` | `lf26-music-east.douyinstatic.com/…/7676427870411033401.mp3` | 域名含 music ✓、`.mp3` ✓ | ✅ 有声音（**唯一能成功的**） |
+| `GUNTbne404o` | `sf6-cdn-tos.douyinstatic.com/obj/tos-cn-ve-2774/oIgHze…` | 域名不含 music ✗、无扩展名 ✗ | ❌ 无声 |
+| `0JWrSFgCzV0` | `sf6-cdn-tos.douyinstatic.com/obj/ies-music/7597905283695905542.mp3` | 域名不含 music ✗ | ❌ 无声 |
+
+> 同一条链接两次抓取时配乐域名还会在 `lf26` / `lf9` / `sf11` / `sf6` 之间漂移，
+> 进一步说明"按域名/后缀猜"这条路本身不可靠。
+
+### 修复（P0）
+
+1. **新增 `extract_item()`：正规解析分享页内联 JSON**
+   （`videoInfoRes.item_list[0]` 括号配平 + `json.loads`，还原 `\u002F`）。
+   标题/作者/点赞/配乐时长改从这里取，解析失败自动降级到原正则，不影响老页面。
+2. **新增 `_audio_url_candidates()`：多源候选链**（去重 + 按可靠性排序）
+   `music.play_url.url_list` → **`video.play_addr.uri`** → 页面 `<audio src>` →
+   放宽后的 `.mp3/.m4a/.aac` 直链正则 → `playwm` 兜底（uri 非 http 时）。
+   放宽正则的核心是**去掉"域名必须含 music"**并接受更多音频扩展名。
+3. **新增 `download_douyin_music()`：候选逐个探测后才落盘**
+   - 先用 `Range: bytes=0-0` 只取 1 字节探测（配乐通常 <1MB，避免白下大文件），
+     不支持 range 时退回完整下载
+   - 按**响应 `Content-Type`** 判定是否为音频并决定扩展名：`audio/mpeg → .mp3`、
+     `audio/mp4` 与「无扩展名 + `video/mp4`」→ `.m4a` —— 这是无扩展名 OSS key 能落盘的关键
+   - 落盘后用 `ffprobe` 校验确实含 audio 流，坏文件删除并换下一个候选
+   - 某个候选 403/类型不对/无法解码时自动换源，全部失败才报错并让用户感知
+
+### 实测（三条真实链接，端到端）
+
+| 链接 | 产物 | 音轨 | 音量 | 时长 |
+|---|---|---|---|---|
+| `G6M5xytCkMM` | `#厦门.mp4` | h264 + **aac** 立体声 | mean −12.7 dB | 26.00s |
+| `GUNTbne404o` | `长路奉献给远方。#干河坝#徒步 #云南徒步.mp4` | h264 + **aac**（m4a 配乐） | mean −14.3 dB | 16.00s |
+| `0JWrSFgCzV0` | `“你说，片刻的幸福总被铭记很久”#infp….mp4` | h264 + **aac** | mean −14.1 dB | 29.00s |
+
+- 后两条此前是**无声**产物，本次全部拿到配乐
+- 另经 HTTP API 端到端复测（`POST /api/tasks` → `done` / `incomplete:false`），
+  日志明确出现 `# 配乐已下载：261.1KB（m4a）`、`# 已合成视频：… 含配乐`
+- 回归：抖音**视频帖**解析不受影响（6 档画质、1080p 直链正常）；
+  离线自测 **208 → 238 项全部通过**（新增 30 项断言）
+
+### 自测补充（含反向用例）
+
+- 内联 JSON 解析：正常 / 无 `videoInfoRes` / `item_list` 为空 / 字段缺失
+- 候选来源：**域名不含 music**、**无扩展名 OSS key**、`music.play_url` 优先、
+  `<audio>` 兜底、图片链接不进候选、候选去重
+- 响应类型识别：`audio/mpeg` / `audio/mp4` / 无扩展名 + `video/mp4` / 图片与 HTML 不误判
+- 下载端到端：跳过非音频候选→换源成功、每候选都走 range 探测、
+  全失败返回原因不落盘、空候选、类型不对不落盘
+- 反向用例：`download_douyin_music` 在"响应不是音频"时**必须不落盘**；
+  地址像音频（`.mp3`）但内容损坏时**必须被 ffprobe 拦下并换下一个候选**
+
+### 已知未做（本轮范围外，等用户拍板）
+
+- **P1**：图片素材仍是单链接单次下载，`url_list` 其余等价链接未参与轮换/补试
+- **P2**：轮播节奏仍按配乐时长均分，未提供"每张固定 N 秒"选项
+
+---
+
 ## 阶段 10：文档沉淀（面向 AI 接手）
 
 **背景**：项目经过 9 个阶段迭代，文档分散在多份文件里，新接手的 AI 需要先读很多内容
