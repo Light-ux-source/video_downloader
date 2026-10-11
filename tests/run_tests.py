@@ -804,6 +804,35 @@ def http_json(url: str, payload: dict | None = None, method: str = "GET") -> tup
         return exc.code, json.loads(exc.read().decode() or "{}")
 
 
+def test_port_precheck() -> None:
+    """启动前端口预检：占用时给出可操作提示，而不是抛 traceback（回归用户报错）。"""
+    import socket
+    import app as app_module
+
+    section("启动端口预检")
+
+    # 空闲端口应通过
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        busy_port = holder.getsockname()[1]
+
+        err = app_module.check_port("127.0.0.1", busy_port)
+        check("占用端口被检出", err is not None, f"→ {err!r}")
+        check("提示含换端口命令", err is not None and "--port" in err, f"→ {(err or '')[:60]}")
+        check("提示含排查命令", err is not None and "lsof" in err, f"→ {(err or '')[-60:]}")
+        check("提示说明如何关闭旧实例", err is not None and "pkill" in err)
+        check("占用者探测不会抛异常（非 VideoHarbor 端口）",
+              isinstance(app_module.describe_port_owner("127.0.0.1", busy_port), str))
+
+    # 端口释放后应通过
+    free_port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    free_port_socket.bind(("127.0.0.1", 0))
+    free_port = free_port_socket.getsockname()[1]
+    free_port_socket.close()
+    check("空闲端口预检通过", app_module.check_port("127.0.0.1", free_port) is None)
+
+
 def test_http_api() -> None:
     section("HTTP 接口")
     config.PORT = 8791
@@ -939,6 +968,7 @@ def main() -> int:
         test_douyin(tmp)
         test_task_state_machine(tmp / "tasks")
 
+    test_port_precheck()
     test_http_api()
     if live:
         test_live()
